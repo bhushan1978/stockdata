@@ -1,0 +1,33 @@
+# --- Secrets: never commit credentials ---
+.env
+.env.*
+!.env.example
+*.token
+*.pem
+*.key
+secrets/
+
+# --- Data: databases, downloaded masters, reports and logs stay local ---
+data/
+logs/
+reports/
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp
+*.wal
+*.db
+*.parquet
+instrument_master/
+api-scrip-master*.csv
+security_id_list*.csv
+
+# --- Python / tooling ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.DS_Store

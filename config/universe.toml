@@ -1,0 +1,11 @@
+# Which rows of the Dhan instrument master form the download universe.
+# Values are matched case-insensitively against the master's columns.
+# Run `python -m stockdata instruments summary --fetch` to see the real values first.
+#
+# Default: NSE cash equities, regular "EQ" series. To widen the universe later,
+# add series (e.g. ["EQ", "BE", "SM"]) or point --universe-file at another file.
+exchange_id = "NSE"
+segment_code = "E"        # E = equity/cash segment
+instrument = "EQUITY"
+series = ["EQ"]
+# instrument_types = []   # optional filter on the exchange instrument-type column
