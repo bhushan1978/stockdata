@@ -4,7 +4,7 @@ import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { Candles } from '../types'
 
 export interface Bar { t: number; o: number; h: number; l: number; c: number; v: number; prev: number | null }
-const props = defineProps<{ data: Candles | null }>()
+const props = defineProps<{ data: Candles | null; gaps?: number[] }>()
 const emit = defineEmits<{ hover: [Bar | null] }>()
 const el = ref<HTMLElement | null>(null)
 let chart: IChartApi | null = null
@@ -52,11 +52,22 @@ function draw() {
   }
   candles.setData(cs)
   volume.setData(vs)
-  markers?.setMarkers(d.flags.filter((f) => byTime.has(f.t)).sort((a, b) => a.t - b.t).slice(0, 400).map((f) => ({
-    time: f.t as UTCTimestamp, position: 'aboveBar' as const, shape: 'circle' as const, color: '#f2a93b', text: '' })))
+  const ms: any[] = d.flags.filter((f) => byTime.has(f.t)).sort((a, b) => a.t - b.t).slice(0, 400).map((f) => ({
+    time: f.t as UTCTimestamp, position: 'aboveBar' as const, shape: 'circle' as const, color: '#f2a93b', text: '' }))
+  // corporate actions: an arrow on the first bar on or after the ex-date (purple = used in the adjusted series, grey = recorded only)
+  const times = d.t
+  for (const ev of d.corporate_actions ?? []) {
+    const dayStart = Date.parse(ev.ex_date.slice(0, 10) + 'T00:00:00Z') / 1000
+    const i = times.findIndex((t) => t >= dayStart)
+    if (i < 0 || times[i] >= dayStart + 7 * 86400) continue
+    ms.push({ time: times[i] as UTCTimestamp, position: 'belowBar' as const, shape: 'arrowUp' as const, color: ev.adjusts ? '#c4b5fd' : '#7b8ba0',
+      text: `${ev.type}${ev.ratio ? ' ' + ev.ratio : ''}${ev.adjusts ? '' : ' (' + ev.status.replace(/_/g, ' ') + ')'}` })
+  }
+  for (const g of (props.gaps ?? []).slice(0, 150)) if (byTime.has(g)) ms.push({ time: g as UTCTimestamp, position: 'belowBar' as const, shape: 'square' as const, color: '#9aa8bd', text: 'gap' })
+  markers?.setMarkers(ms.sort((a, b) => a.time - b.time))
   chart.timeScale().fitContent()
 }
-watch(() => props.data, draw)
+watch(() => [props.data, props.gaps], draw)
 defineExpose({ reset: () => chart?.timeScale().fitContent() })
 </script>
 <template><div ref="el" style="position:absolute;inset:0"></div></template>

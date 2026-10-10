@@ -163,8 +163,10 @@ def test_quality_report_separates_failures_warnings_and_expected_behaviour(data_
         wid, ts = db.con.execute("SELECT window_id, candle_timestamp FROM candles_15min WHERE security_id = 900001 ORDER BY 2 LIMIT 1").fetchone()
         for kind in ("negative_volume", "post_close_bar", "weekend_candle"):
             db.con.execute("INSERT INTO data_anomalies VALUES ('NSE_EQ', 900001, ?, ?, 'test', ?, now())", [ts, kind, wid])
-        db.con.execute("INSERT INTO download_windows VALUES (999999, 'NSE_EQ', 900002, '2023-01-01', '2023-03-01', 'failed', 3, NULL, 0, "
-                       "NULL, NULL, NULL, 400, 'DH-905', 'bad', now(), now(), NULL)")
+        db.con.execute("INSERT INTO download_windows (window_id, exchange_segment, security_id, window_from, window_to, status, attempts, "
+                       "rows_received, rows_inserted, rows_flagged, rows_revised, zero_volume_rows, http_status, error_code, error_message, "
+                       "first_attempt_at_utc, last_attempt_at_utc, completed_at_utc) VALUES (999999, 'NSE_EQ', 900002, '2023-01-01', "
+                       "'2023-03-01', 'failed', 3, NULL, 0, NULL, NULL, NULL, 400, 'DH-905', 'bad', now(), now(), NULL)")
     assert env.client.post("/api/quality/15min/run").status_code == 200
     state = wait_for(lambda: (lambda s: s if not s["running"] and s["report"] else None)(env.client.get("/api/quality/15min").json()), timeout=60)
     assert state["error"] is None
@@ -178,6 +180,12 @@ def test_quality_report_separates_failures_warnings_and_expected_behaviour(data_
     assert rep["severity_summary"]["confirmed_failures"] == 1 and rep["severity_summary"]["warnings"] == 1
     assert "15:00" in rep["expected_note"] and "not" in rep["expected_note"]                       # the F&O 15:00 bar is documented as expected
     assert rep["bars_per_session"] and state["stale"] is False
+    rec = rep["reconciliation"]                                                                    # coverage & reconciliation ride along
+    assert set(rec) >= {"missing_sessions", "stale", "abnormal_volume", "provider_disagreements", "final_candle"}
+    assert rec["missing_sessions"]["instruments_with_data"] == 3 and rec["provider_disagreements"]["total"] == 0
+    life = env.client.get("/api/lifecycle/15min")
+    assert life.status_code == 200 and set(life.json()) >= {"renamed", "symbol_reused", "isin_shared", "left_the_master", "notes"}
+    assert env.client.get("/api/lifecycle/weekly").status_code == 422
     csv_resp = env.client.get("/api/quality/15min/coverage.csv")
     assert csv_resp.status_code == 200 and csv_resp.text.startswith("symbol,security_id")
     assert list(env.settings.reports_dir.glob("coverage_15min_*.csv"))

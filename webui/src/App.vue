@@ -38,9 +38,11 @@ const needsAttention = computed(() => (jobs.value ? jobs.value.failed + jobs.val
 const active = computed<any[]>(() => ui.overview?.active ?? [])
 const groups = [
   { title: '', items: [{ to: '/', label: 'Overview' }] },
-  { title: 'Downloads', items: [{ to: '/download', label: 'Download Center' }, { to: '/queue', label: 'Job Queue' }, { to: '/activity', label: 'Activity & Logs' }] },
-  { title: 'Data', items: [{ to: '/explorer', label: 'Data Explorer' }, { to: '/quality', label: 'Data Quality' }, { to: '/instruments', label: 'Instruments' }] },
-  { title: 'System', items: [{ to: '/settings', label: 'Settings & Health' }] },
+  { title: 'Historical data', items: [{ to: '/download', label: 'Historical Download' }] },
+  { title: 'Live & current data', items: [{ to: '/live', label: 'Live Updates' }, { to: '/automation', label: 'Automation' }] },
+  { title: 'Work', items: [{ to: '/queue', label: 'Job Queue' }, { to: '/activity', label: 'Activity & Logs' }] },
+  { title: 'Data', items: [{ to: '/explorer', label: 'Data Explorer' }, { to: '/quality', label: 'Data Quality' }, { to: '/corporate', label: 'Corporate Actions' }, { to: '/instruments', label: 'Instruments' }] },
+  { title: 'System', items: [{ to: '/providers', label: 'Providers' }, { to: '/settings', label: 'Settings & Health' }] },
 ]
 
 </script>
@@ -49,7 +51,7 @@ const groups = [
   <div class="shell">
     <aside class="side">
       <div class="brand"><span style="font-size:18px">▮▮▯</span><span>STOCK<b>DATA</b> CENTER</span></div>
-      <div style="padding:0 10px 6px"><button class="primary" style="width:100%;justify-content:center" @click="router.push('/download')">＋ New download</button></div>
+      <div style="padding:0 10px 6px"><button class="primary" style="width:100%;justify-content:center" @click="router.push('/download')">＋ Historical download</button></div>
       <nav class="nav">
         <template v-for="g in groups" :key="g.title">
           <div v-if="g.title" class="navtitle">{{ g.title }}</div>
@@ -57,7 +59,7 @@ const groups = [
             <span>{{ n.label }}</span>
             <span v-if="n.to === '/queue' && jobs && (jobs.queued || jobs.running)" class="pill" :title="jobs.running + ' running, ' + jobs.queued + ' queued'">{{ jobs.running }}▶ {{ jobs.queued }}</span>
             <span v-else-if="n.to === '/queue' && needsAttention" class="pill warn" title="Jobs needing your attention">{{ needsAttention }}!</span>
-            <span v-if="n.to === '/settings' && ui.overview && !ui.overview.credentials?.ready" class="pill red" title="Credentials missing">!</span>
+            <span v-if="n.to === '/providers' && ui.overview?.providers?.readiness?.some((r: any) => r.in_use && r.problem)" class="pill red" title="A provider in use cannot start jobs (credentials)">!</span>
           </RouterLink>
         </template>
       </nav>

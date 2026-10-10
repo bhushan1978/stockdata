@@ -170,6 +170,38 @@ def test_candles_missing_locally_are_added_and_the_database_stays_consistent(ren
     assert all(c.ok for c in integrity_checks(db))                          # every new candle belongs to a complete window
 
 
+def test_fill_only_adds_missing_candles_but_never_replaces_a_stored_one(renv):
+    tf, db, fake = renv
+    k = tf.key_col
+    sim = revise(fake)                                                      # the source now disagrees with what is stored (before 10 Mar)
+    gone = [r[0] for r in db.con.execute(f"SELECT {k} FROM {tf.table} WHERE security_id = 900001 ORDER BY {k} LIMIT 12 OFFSET 40").fetchall()]
+    db.con.execute(f"DELETE FROM {tf.table} WHERE security_id = 900001 AND {k} IN (SELECT {k} FROM {tf.table} WHERE security_id = 900001 "
+                   f"ORDER BY {k} LIMIT 12 OFFSET 40)")
+    kept = values(db, 900001)
+    n_before = count(db, tf.table)
+    stats = refresh(db, fake, ["SIMALPHA"], fill_only=True)
+    expected = truth(sim, tf)
+    assert stats["status"] == "completed" and stats["results"][0].added == 12 == count(db, tf.table) - n_before
+    after = values(db, 900001)
+    assert {key: after[key] for key in kept} == kept                        # every candle that was stored is byte-identical afterwards
+    assert all(after[g] == expected[g] for g in gone)                       # the holes now hold what the source serves
+    assert any(after[key] != expected[key] for key in after)                # ... while the stored history it disagrees with was left alone
+    assert db.con.execute("SELECT change_type, count(*) FROM refresh_changes GROUP BY 1").fetchall() == [("added", 12)]   # no 'revised' row ever
+    assert count(db, "candle_revisions") > 0                                # the disagreement is recorded for review, not applied
+    assert db.con.execute("SELECT fill_only FROM refresh_jobs").fetchall() == [(True,)]
+    assert all(c.ok for c in integrity_checks(db))
+
+
+def test_a_fill_only_job_and_a_replacing_job_are_separate_jobs_and_replace_still_replaces(renv):
+    tf, db, fake = renv
+    sim = revise(fake)
+    refresh(db, fake, ["SIMALPHA"], fill_only=True)                         # nothing missing: stores nothing
+    assert values(db, 900001) != truth(sim, tf)
+    refresh(db, fake, ["SIMALPHA"])                                         # the explicit repair: replaces
+    assert values(db, 900001) == truth(sim, tf)
+    assert db.con.execute("SELECT coalesce(fill_only, false), count(*) FROM refresh_jobs GROUP BY 1 ORDER BY 1").fetchall() == [(False, 1), (True, 1)]
+
+
 def _absent_scenario(tf, fake):
     sim = fake.instruments[900001]
     sim.listing = date(2023, 9, 1) if not tf.is_intraday else date(2024, 2, 1)   # earlier candles are no longer served

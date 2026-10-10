@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING, Callable
 
 import requests
 
+from stockdata.providers.errors import AuthError, PermanentError, ProviderError, TransientError
+
 if TYPE_CHECKING:  # pragma: no cover
     from stockdata.budget import RequestBudget
 
@@ -29,29 +31,20 @@ RATE_LIMIT_CODES = {"DH-904", "DH-805"}
 TRANSIENT_CODES = {"DH-908", "DH-909"}
 
 
-class DhanError(Exception):
-    def __init__(self, message: str, *, http_status: int | None = None,
-                 error_code: str | None = None, attempts: int = 0):
-        super().__init__(message)
-        self.message = message
-        self.http_status = http_status
-        self.error_code = error_code
-        self.attempts = attempts
+class DhanError(ProviderError):
+    """Dhan's errors are the shared provider errors with a Dhan name (the downloader catches the shared base classes)."""
 
 
-class DhanAuthError(DhanError):
+class DhanAuthError(DhanError, AuthError):
     pass
 
 
-class DhanPermanentError(DhanError):
+class DhanPermanentError(DhanError, PermanentError):
     pass
 
 
-class DhanTransientError(DhanError):
-    def __init__(self, *a, retry_after: float | None = None, rate_limited: bool = False, **kw):
-        super().__init__(*a, **kw)
-        self.retry_after = retry_after
-        self.rate_limited = rate_limited
+class DhanTransientError(DhanError, TransientError):
+    pass
 
 
 @dataclass
@@ -116,10 +109,17 @@ class DhanClient:
         return self._rng.uniform(ceiling / 2, ceiling)
 
     def post(self, path: str, payload: dict) -> DhanResponse:
+        return self._request("POST", path, payload)
+
+    def get_json(self, path: str) -> dict:
+        """GET (the profile call of the connection test). Counted in the same budget and classified like any other call."""
+        return self._request("GET", path, None).data
+
+    def _request(self, method: str, path: str, payload: dict | None) -> DhanResponse:
         for attempt in range(1, self.max_attempts + 1):
             self.limiter.wait()
             try:
-                data, status = self._once(path, payload)
+                data, status = self._once(path, payload, method)
             except DhanTransientError as exc:
                 exc.attempts = attempt
                 if exc.rate_limited:
@@ -138,13 +138,16 @@ class DhanClient:
             return DhanResponse(data, status, attempt)
         raise AssertionError("unreachable")  # pragma: no cover
 
-    def _once(self, path: str, payload: dict) -> tuple[dict, int]:
+    def _once(self, path: str, payload: dict | None, method: str = "POST") -> tuple[dict, int]:
         if self.budget is not None:
             self.budget.acquire()     # counts this attempt (retries included) or raises RequestLimitReached BEFORE sending
         self.requests_sent += 1
         try:
-            resp = self.session.post(self.base_url + path, json=payload,
-                                     headers=self._headers, timeout=self.timeout)
+            if method == "GET":
+                resp = self.session.get(self.base_url + path, headers=self._headers, timeout=self.timeout)
+            else:
+                resp = self.session.post(self.base_url + path, json=payload,
+                                         headers=self._headers, timeout=self.timeout)
         except requests.RequestException as exc:
             raise DhanTransientError(f"network error: {type(exc).__name__}") from exc
         status = resp.status_code

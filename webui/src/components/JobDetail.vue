@@ -56,6 +56,9 @@ const live = (j: Job) => ['preparing', 'running', 'stopping'].includes(j.status)
         </div>
       </div>
       <div class="kv small">
+        <span>Workflow</span><span>{{ job.workflow ?? job.kind }} <span class="badge" :class="job.lane === 'live' ? 'b-ok' : 'b-info'">{{ job.lane }}</span></span>
+        <span v-if="job.provider">Provider</span><span v-if="job.provider">{{ job.provider }}<template v-if="job.yielded_to"> · paused so live job #{{ job.yielded_to }} could write; it resumes by itself</template></span>
+        <span v-if="job.live">Live settings</span><span v-if="job.live" class="mono small">overlap {{ job.live.overlap_days ?? 'default' }} d<template v-if="job.kind === 'poll'"> · every {{ job.live.poll_seconds }} s · {{ job.live.max_cycles ? 'max ' + job.live.max_cycles + ' polls' : 'until the session ends' }}</template></span>
         <span>Dataset</span><span>{{ job.kind === 'instruments_load' ? 'instrument master' : job.timeframe === 'daily' ? 'Daily' : '15-minute' }}</span>
         <span>Selection</span><span>{{ job.selection ? (job.selection.mode === 'all' ? 'entire universe' : (job.selection.count ?? job.selection.symbols.length) + ' instruments' + (job.selection.symbols.length ? ': ' + job.selection.symbols.slice(0, 6).join(', ') : '')) : '-' }}</span>
         <span>Range</span><span class="mono">{{ job.plan ? job.plan.resolved_start + ' → ' + job.plan.end_exclusive + ' (excl.)' : (job.range.start ?? 'default') + ' → ' + (job.range.end ?? 'latest') }}</span>

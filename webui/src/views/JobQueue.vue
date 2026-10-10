@@ -82,7 +82,7 @@ const CAMP_TEXT: Record<string, string> = {
   delete: 'The campaign and its finished jobs are removed from the history, with their logs. Downloaded data is not affected.',
 }
 const cols = [
-  { key: 'id', label: '#', sortable: true, mono: true }, { key: 'name', label: 'Job', sortable: true }, { key: 'tf', label: 'Set' },
+  { key: 'id', label: '#', sortable: true, mono: true }, { key: 'name', label: 'Job', sortable: true }, { key: 'tf', label: 'Workflow · data' },
   { key: 'status', label: 'Status', sortable: true }, { key: 'progress', label: 'Progress (windows done / planned)' },
   { key: 'attempts_used', label: 'Attempts', align: 'right' as const, mono: true }, { key: 'started_at', label: 'Started', sortable: true },
   { key: 'last_activity_at', label: 'Last activity' }, { key: 'actions', label: 'Actions' }, { key: 'move', label: '' },
@@ -94,7 +94,7 @@ const rowsOf = (list: Job[]) => list.map((j) => ({ ...j, tf: j.kind === 'instrum
   <div>
     <div class="page-head"><div><h1>Job Queue</h1>
       <p>Jobs are stored durably: closing the browser or restarting the application loses nothing. Pause, Stop, Cancel and Resume are different on purpose — hover a button or open “What is the difference?”.</p></div>
-      <div class="btnrow"><RouterLink class="btn primary" to="/download">New download</RouterLink>
+      <div class="btnrow"><RouterLink class="btn primary" to="/download">Historical download</RouterLink><RouterLink class="btn" to="/live">Live update</RouterLink>
         <button :disabled="!eligible.length" :title="eligible.length ? 'Queue every paused, interrupted, stopped or failed job again' : 'Nothing is waiting to be resumed'" @click="resumeAsk = true">Resume eligible ({{ eligible.length }})</button>
         <span class="muted small">Queue processing:</span>
         <div class="seg"><button :class="{ on: ui.health?.queue_enabled }" @click="queueSwitch(true)">On</button><button :class="{ on: ui.health && !ui.health.queue_enabled }" @click="ui.health?.queue_enabled ? (queueOffAsk = true) : null">Off</button></div>
@@ -106,12 +106,17 @@ const rowsOf = (list: Job[]) => list.map((j) => ({ ...j, tf: j.kind === 'instrum
 
     <template v-if="tab !== 'campaigns'">
       <div class="panel tight">
-        <DataTable :columns="cols" :rows="rowsOf(tab === 'queue' ? open : history)" row-key="id" :active-key="selected" :empty="loaded ? (tab === 'queue' ? 'No active or queued jobs. Start one from the Download Center.' : 'No finished jobs yet.') : 'Loading…'" @row-click="(r: any) => (selected = selected === r.id ? null : r.id)">
+        <DataTable :columns="cols" :rows="rowsOf(tab === 'queue' ? open : history)" row-key="id" :active-key="selected" :empty="loaded ? (tab === 'queue' ? 'No active or queued jobs. Start one from Historical Download or Live Updates.' : 'No finished jobs yet.') : 'Loading…'" @row-click="(r: any) => (selected = selected === r.id ? null : r.id)">
           <template #cell-name="{ row }"><b>{{ row.name }}</b><span v-if="row.campaign_id" class="badge b-info" style="margin-left:6px">campaign #{{ row.campaign_id }}·{{ row.campaign_pos }}</span>
             <span v-if="row.scheduled_for" class="badge b-warning" style="margin-left:6px" title="Will not start before this time">⏰ {{ ist(row.scheduled_for) }}</span>
             <div v-if="row.block_reason && row.status === 'queued'" class="muted small">waiting: {{ row.block_reason }}</div>
             <div v-else-if="row.last_error && ['failed','interrupted'].includes(row.status)" class="down small">{{ row.last_error.slice(0, 110) }}</div>
             <div v-else-if="row.next_action && ['failed','interrupted','stopped_by_limit','paused','stopped'].includes(row.status)" class="warn small">{{ row.next_action.slice(0, 120) }}</div></template>
+          <template #cell-tf="{ row }"><span class="badge" :class="row.lane === 'live' ? 'b-ok' : 'b-info'" :title="row.workflow">{{ row.lane === 'live' ? 'live' : row.kind === 'instruments_load' ? 'master' : 'historical' }}</span>
+            <span v-if="row.kind === 'refresh'" class="badge b-warning" style="margin-left:4px">repair</span>
+            <span v-if="row.kind === 'poll'" class="badge b-running" style="margin-left:4px">polling</span>
+            <div class="small muted">{{ row.timeframe === 'daily' ? 'daily' : row.timeframe === '15min' ? '15-minute' : 'instrument master' }}<template v-if="row.provider"> · {{ row.provider }}</template></div>
+            <div v-if="row.yielded_to" class="small warn">paused for live job #{{ row.yielded_to }}</div></template>
           <template #cell-status="{ row }"><StatusBadge :status="row.status" /><span v-if="row.worker?.stale" class="warn small"> stalled?</span></template>
           <template #cell-progress="{ row }">
             <div style="min-width:200px"><ProgressBar :fraction="row.progress.fraction" /><span class="small mono muted">{{ num(row.progress.windows_done) }} / {{ row.progress.windows_planned === null ? '?' : num(row.progress.windows_planned) }}

@@ -1,7 +1,12 @@
 export type Timeframe = 'daily' | '15min'
 
+export type Provider = 'dhan' | 'fyers' | 'upstox'
+export const PROVIDER_LABEL: Record<Provider, string> = { dhan: 'Dhan', fyers: 'FYERS', upstox: 'Upstox' }
+
 export interface Job {
-  id: number; name: string; kind: 'download' | 'instruments_load'; timeframe: Timeframe | null; status: string
+  id: number; name: string; kind: 'download' | 'instruments_load' | 'update' | 'poll' | 'refresh'; timeframe: Timeframe | null; status: string
+  provider?: Provider | null; lane?: 'historical' | 'live'; workflow?: string; yielded_to?: number | null
+  live?: { overlap_days: number | null; seed_days: number | null; poll_seconds: number; max_cycles: number | null } | null
   command: string | null; campaign_id: number | null; campaign_pos: number | null
   created_at: string; queued_at: string | null; started_at: string | null; finished_at: string | null; last_activity_at: string | null
   runs: number; exit_code: number | null; engine_status: string | null
@@ -53,6 +58,10 @@ export interface Cov { candles: number | null; first: string | null; last: strin
 export interface Candles {
   timeframe: Timeframe; security_id: number; symbol: string; name: string; timezone: string; n: number; truncated: boolean
   t: number[]; o: number[]; h: number[]; l: number[]; c: number[]; v: number[]; flags: { t: number; kind: string }[]
+  basis?: 'raw' | 'adjusted'
+  adjustment?: { basis: 'raw' | 'adjusted'; label: string; version: number | null; as_of: string | null; status: string; note?: string
+    events_applied: { ex_date: string; price_factor: number; volume_factor: number }[] }
+  corporate_actions?: { action_id: string; type: string; ex_date: string; ratio: string | null; factor: number | null; status: string; adjusts: boolean; application_status: string | null }[]
   coverage: { bars_total: number; first_candle: string | null; last_candle: string | null; covered_from: string | null; covered_to: string | null
     windows_complete: number; windows_empty: number; outstanding: { from: string; to: string; status: string; error_code: string | null; message: string; attempts: number }[] }
   warnings: Warning[]

@@ -37,7 +37,8 @@ function openChart(tf: string) { void router.push({ path: '/explorer', query: { 
     <div class="page-head">
       <div><h1>Overview</h1><p>Everything below is read from the databases, the request ledger and the job queue. Cached values are labelled with their age.</p></div>
       <div class="btnrow">
-        <RouterLink class="btn primary" to="/download">Start a download</RouterLink>
+        <RouterLink class="btn primary" to="/download">Historical download</RouterLink>
+        <RouterLink class="btn" to="/live">Live update</RouterLink>
         <button :disabled="!o.resumable.length || busy" :title="o.resumable.length ? 'Queue every paused, interrupted, stopped or failed job to resume from its last committed window' : 'Nothing to resume'" @click="resumeAsk = true">Resume eligible ({{ o.resumable.length }})</button>
         <button @click="openChart('daily')">Open charts</button>
         <RouterLink class="btn" to="/quality">Review failures<span v-if="o.outstanding_failed_windows">&nbsp;({{ num(o.outstanding_failed_windows) }})</span></RouterLink>
@@ -46,9 +47,8 @@ function openChart(tf: string) { void router.push({ path: '/explorer', query: { 
 
     <Banner v-if="worst" :kind="worst.level === 'error' ? 'error' : 'warn'"><b>{{ worst.title }}.</b> {{ worst.detail }}
       <span v-if="findings.length > 1"> ({{ findings.length - 1 }} more finding(s).)</span> <RouterLink to="/settings?tab=health">Open System health</RouterLink></Banner>
-    <Banner v-if="!o.credentials.ready" kind="error">Dhan credentials are not configured, so no download can start. <RouterLink to="/settings">Open Settings → Credentials</RouterLink>.</Banner>
-    <Banner v-else-if="o.credentials.access_token.expired" kind="error">The Dhan access token has expired. <RouterLink to="/settings">Update it in Settings</RouterLink>, then resume stopped jobs.</Banner>
-    <Banner v-else-if="o.credentials.access_token.seconds_left !== undefined && o.credentials.access_token.seconds_left < 7200" kind="warn">The Dhan access token expires in {{ duration(o.credentials.access_token.seconds_left) }} ({{ o.credentials.access_token.expires_at_ist }} IST). A longer download will stop cleanly at expiry and can be resumed after you update it.</Banner>
+    <Banner v-for="r in (o.providers?.readiness ?? []).filter((x: any) => x.in_use && x.problem)" :key="r.provider" kind="error"><b>{{ r.label }}:</b> {{ r.problem.replace(/ \((Settings -> Credentials|Providers screen)\)/, '') }}, so jobs for it cannot start. <RouterLink to="/providers">Open Providers</RouterLink>.</Banner>
+    <Banner v-if="o.providers?.default === 'dhan' && o.credentials.ready && !o.credentials.access_token.expired && o.credentials.access_token.seconds_left !== undefined && o.credentials.access_token.seconds_left < 7200" kind="warn">The Dhan access token expires in {{ duration(o.credentials.access_token.seconds_left) }} ({{ o.credentials.access_token.expires_at_ist }} IST). A longer download will stop cleanly at expiry and can be resumed after you update it.</Banner>
     <Banner v-if="o.disk.level !== 'ok'" :kind="o.disk.level === 'critical' ? 'error' : 'warn'">Free disk space is low: {{ bytes(o.disk.free_bytes) }} (warning below {{ o.disk.warn_below_gb }} GB). Downloads will not start without enough room.</Banner>
     <Banner v-if="!o.health.scheduler_alive" kind="error">The job scheduler thread is not running; queued jobs will not start. Restart the server.</Banner>
     <Banner v-if="!o.health.queue_enabled" kind="warn">Queue processing is switched off: queued jobs wait until you switch it on in the Job Queue page (Start now still works).</Banner>
@@ -114,7 +114,7 @@ function openChart(tf: string) { void router.push({ path: '/explorer', query: { 
           <span>Download workers</span><span>{{ o.health.workers_active }} active</span>
           <span>Disk free</span><span class="mono">{{ bytes(o.disk.free_bytes) }} of {{ bytes(o.disk.total_bytes) }}</span>
           <span>Data directory</span><span class="mono small" style="word-break:break-all">{{ o.paths.data_dir }}</span>
-          <span>Credentials</span><span>{{ o.credentials.ready ? 'configured (' + o.credentials.access_token.source + ')' : 'missing' }}</span>
+          <span>Provider</span><span>{{ (o.providers?.readiness ?? []).filter((r: any) => r.in_use).map((r: any) => r.label + (r.problem ? ' (not ready)' : ' (ready)')).join(', ') || '-' }}</span>
         </div>
       </div>
     </div>

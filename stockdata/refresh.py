@@ -25,11 +25,13 @@ from datetime import datetime
 
 from stockdata.budget import RequestLimitReached
 from stockdata.db import CandleDB
-from stockdata.dhan import DhanAuthError, DhanClient, DhanPermanentError, DhanTransientError
 from stockdata.downloader import RunAborted, limit_abort
 from stockdata.instruments import Instrument
+from stockdata.providers import get_provider
+from stockdata.providers.base import ProviderAdapter
+from stockdata.providers.errors import AuthError, PermanentError, TransientError
 from stockdata.timeutil import utcnow
-from stockdata.validation import ValidationError, validate_response
+from stockdata.validation import ValidationError
 from stockdata.windows import Window, chunk_backward
 
 log = logging.getLogger("stockdata.refresh")
@@ -48,6 +50,10 @@ class RefreshOptions:
     intraday_date_format: str = "datetime"
     client_id: str | None = None
     breaker: int = 5
+    provider: str | None = None            # who supplies the replacement data (None = Dhan, as before provider support)
+    allow_cross_provider: bool = False     # replacing candles stored from a DIFFERENT provider must be asked for explicitly
+    fill_only: bool = False                # only ADD candles that are missing; a differing stored candle is kept and the difference
+                                           # is recorded as a disagreement (the safe way to repair a hole inside a completed window)
 
 
 @dataclass
@@ -65,8 +71,9 @@ class InstrumentRefresh:
 
 
 class Refresher:
-    def __init__(self, db: CandleDB, client: DhanClient):
+    def __init__(self, db: CandleDB, client, provider: ProviderAdapter | None = None):
         self.db, self.client, self.tf = db, client, db.tf
+        self.provider = provider or get_provider("dhan")
         self._consecutive_retriable = 0
 
     # ------------------------------------------------------------------ run
@@ -108,8 +115,9 @@ class Refresher:
         """(open job id or None, windows still to request) without writing anything."""
         con = self.db.con
         row = con.execute("""SELECT job_id FROM refresh_jobs WHERE exchange_segment = ? AND security_id = ?
-                             AND range_from = ? AND range_to = ? AND status = 'open' ORDER BY job_id DESC LIMIT 1""",
-                          [inst.exchange_segment, inst.security_id, opts.start, opts.end]).fetchone()
+                             AND range_from = ? AND range_to = ? AND status = 'open' AND coalesce(fill_only, false) = ?
+                             ORDER BY job_id DESC LIMIT 1""",
+                          [inst.exchange_segment, inst.security_id, opts.start, opts.end, bool(opts.fill_only)]).fetchone()
         if row:
             todo = con.execute("""SELECT window_from, window_to FROM refresh_windows WHERE job_id = ?
                                   AND status IN ('pending', 'retriable'""" + (", 'failed'" if opts.retry_failed else "") +
@@ -125,9 +133,10 @@ class Refresher:
         con.begin()
         try:
             job_id = self.db.next_id("refresh_jobs", "job_id")
-            con.execute("INSERT INTO refresh_jobs VALUES (?, ?, ?, ?, ?, ?, 'open', ?, NULL, ?, NULL)",
+            con.execute("INSERT INTO refresh_jobs (job_id, exchange_segment, security_id, range_from, range_to, prune_missing, status, "
+                        "created_at_utc, finished_at_utc, command, note, fill_only) VALUES (?, ?, ?, ?, ?, ?, 'open', ?, NULL, ?, NULL, ?)",
                         [job_id, inst.exchange_segment, inst.security_id, opts.start, opts.end, opts.prune_missing,
-                         utcnow(), command or f"refresh {self.tf.name}"])
+                         utcnow(), command or f"refresh {self.tf.name}", bool(opts.fill_only)])
             for w in todo:
                 con.execute("INSERT INTO refresh_windows (job_id, window_from, window_to, status, attempts) "
                             "VALUES (?, ?, ?, 'pending', 0)", [job_id, w.start, w.end])
@@ -174,23 +183,38 @@ class Refresher:
         return res
 
     # ----------------------------------------------------------------- per window
+    def _foreign_providers(self, inst: Instrument, w: Window) -> list[str]:
+        """Providers other than the current one that supplied candles stored in this window (legacy NULL = Dhan)."""
+        k, tf = self.tf.key_col, self.tf
+        span = (f"{k} >= CAST(? AS DATE) AND {k} < CAST(? AS DATE)" if not tf.is_intraday else f"{k} >= ? AND {k} < ?")
+        rows = self.db.con.execute(
+            f"SELECT DISTINCT coalesce(provider, 'dhan') FROM {tf.table} WHERE exchange_segment = ? AND security_id = ? AND {span}",
+            [inst.exchange_segment, inst.security_id, w.start, w.end]).fetchall()
+        return sorted(r[0] for r in rows if r[0] != self.provider.name)
+
     def _refresh_window(self, job_id: int, inst: Instrument, w: Window, opts: RefreshOptions, prune: bool,
                         res: InstrumentRefresh) -> str:
-        payload = self.tf.payload(inst, w.start, w.end, intraday_date_format=opts.intraday_date_format,
-                                  client_id=opts.client_id)
+        prov = self.provider
+        foreign = [] if (opts.allow_cross_provider or opts.fill_only) else self._foreign_providers(inst, w)   # adding never replaces
+        if foreign:                                       # refused BEFORE any request: nothing spent, nothing changed
+            msg = (f"candles in this window were stored from {', '.join(foreign)}; replacing them with {prov.name} data needs "
+                   "an explicit cross-provider repair (--allow-cross-provider / 'Allow replacing another provider's candles')")
+            self._mark(job_id, w, "failed", 0, None, "cross_provider_blocked", msg)
+            log.warning("%s %s refresh [%s, %s): %s", inst.symbol, self.tf.name, w.start, w.end, msg)
+            return "failed"
         try:
-            resp = self.client.post(self.tf.endpoint, payload)
+            resp = prov.fetch(self.client, inst, self.tf, w, opts)
         except RequestLimitReached as exc:
             raise limit_abort(exc) from exc              # nothing recorded, nothing changed
-        except DhanAuthError as exc:
+        except AuthError as exc:
             raise RunAborted(f"authentication rejected ({exc.message}); refresh the access token and rerun the same "
                              "command to resume. No stored candle was changed.") from exc
-        except DhanPermanentError as exc:                # includes the ambiguous daily DH-907: never read as "empty"
+        except PermanentError as exc:                    # includes the ambiguous daily DH-907: never read as "empty"
             self._mark(job_id, w, "failed", exc.attempts, exc.http_status, exc.error_code, exc.message)
             self._consecutive_retriable = 0
             log.error("%s %s refresh [%s, %s): FAILED %s (stored candles untouched)", inst.symbol, self.tf.name, w.start, w.end, exc.message)
             return "failed"
-        except DhanTransientError as exc:
+        except TransientError as exc:
             self._mark(job_id, w, "retriable", exc.attempts, exc.http_status, exc.error_code, exc.message)
             self._consecutive_retriable += 1
             log.error("%s %s refresh [%s, %s): RETRIABLE after %d attempts: %s (stored candles untouched)",
@@ -201,12 +225,12 @@ class Refresher:
             return "retriable"
         self._consecutive_retriable = 0
         try:
-            v = validate_response(self.tf, resp.data, w)  # validate fully BEFORE touching any stored candle
+            v = prov.to_canonical(self.tf, resp, w)       # validate fully BEFORE touching any stored candle
         except ValidationError as exc:
             self._mark(job_id, w, "failed", resp.attempts, resp.http_status, exc.code, exc.message)
             log.error("%s %s refresh [%s, %s): FAILED validation %s (stored candles untouched)", inst.symbol, self.tf.name, w.start, w.end, exc)
             return "failed"
-        return self._apply(job_id, inst, w, v, resp.attempts, resp.http_status, prune, res)
+        return self._apply(job_id, inst, w, v, resp.attempts, resp.http_status, prune and not opts.fill_only, res, fill_only=opts.fill_only)
 
     def _mark(self, job_id: int, w: Window, status: str, attempts: int, http_status, error_code, error_message) -> None:
         """Record a non-applied outcome. Never touches candles."""
@@ -219,8 +243,9 @@ class Refresher:
 
     # --------------------------------------------------------------- the atomic apply
     def _apply(self, job_id: int, inst: Instrument, w: Window, v, attempts: int, http_status, prune: bool,
-               res: InstrumentRefresh) -> str:
+               res: InstrumentRefresh, *, fill_only: bool = False) -> str:
         db, tf, con = self.db, self.tf, self.db.con
+        prov = self.provider.name
         t, k, now = tf.table, tf.key_col, utcnow()
         key_s = f"CAST(s.{k} AS DATE)" if not tf.is_intraday else f"s.{k}"
         span = (f"c.{k} >= CAST(? AS DATE) AND c.{k} < CAST(? AS DATE)" if not tf.is_intraday
@@ -261,38 +286,44 @@ class Refresher:
                 gone = f"{stored} AND NOT EXISTS (SELECT 1 FROM rstage s WHERE {join})"
                 missing = con.execute(f"SELECT count(*) FROM {t} c WHERE {gone}", ident + rng).fetchone()[0]
                 # ---- audit first (same transaction), old versus new
+                chg_cols = ("job_id, exchange_segment, security_id, candle_key, change_type, old_open, old_high, old_low, old_close, "
+                            "old_volume, new_open, new_high, new_low, new_close, new_volume, applied_at_utc, old_provider, new_provider")
                 if changed:
-                    con.execute(f"""INSERT INTO refresh_changes SELECT ?, c.exchange_segment, c.security_id,
-                        CAST(c.{k} AS TIMESTAMP), 'revised', {olds}, {news}, ? FROM {t} c JOIN rstage s ON {join}
-                        WHERE {differs}""", [job_id, now])
-                    con.execute(f"""INSERT INTO candle_revisions SELECT c.exchange_segment, c.security_id,
-                        CAST(c.{k} AS TIMESTAMP), {olds}, {news}, c.window_id, ? FROM {t} c JOIN rstage s ON {join}
-                        WHERE {differs} ON CONFLICT DO NOTHING""", [now])
+                    if not fill_only:
+                        con.execute(f"""INSERT INTO refresh_changes ({chg_cols}) SELECT ?, c.exchange_segment, c.security_id,
+                            CAST(c.{k} AS TIMESTAMP), 'revised', {olds}, {news}, ?, c.provider, ? FROM {t} c JOIN rstage s ON {join}
+                            WHERE {differs}""", [job_id, now, prov])
+                    con.execute(f"""INSERT INTO candle_revisions (exchange_segment, security_id, candle_key, old_open, old_high,
+                        old_low, old_close, old_volume, new_open, new_high, new_low, new_close, new_volume, window_id,
+                        detected_at_utc, old_provider, new_provider)
+                        SELECT c.exchange_segment, c.security_id, CAST(c.{k} AS TIMESTAMP), {olds}, {news}, c.window_id, ?,
+                               c.provider, ? FROM {t} c JOIN rstage s ON {join}
+                        WHERE {differs} ON CONFLICT DO NOTHING""", [now, prov])
                 if added:
-                    con.execute(f"""INSERT INTO refresh_changes SELECT ?, s.exchange_segment, s.security_id,
-                        CAST(s.{k} AS TIMESTAMP), 'added', {nulls}, {news}, ? FROM rstage s
-                        WHERE NOT EXISTS (SELECT 1 FROM {t} c WHERE {join})""", [job_id, now])
+                    con.execute(f"""INSERT INTO refresh_changes ({chg_cols}) SELECT ?, s.exchange_segment, s.security_id,
+                        CAST(s.{k} AS TIMESTAMP), 'added', {nulls}, {news}, ?, NULL, ? FROM rstage s
+                        WHERE NOT EXISTS (SELECT 1 FROM {t} c WHERE {join})""", [job_id, now, prov])
                 if missing:
-                    con.execute(f"""INSERT INTO refresh_changes SELECT ?, c.exchange_segment, c.security_id,
-                        CAST(c.{k} AS TIMESTAMP), ?, {olds}, {nulls}, ? FROM {t} c WHERE {gone}""",
+                    con.execute(f"""INSERT INTO refresh_changes ({chg_cols}) SELECT ?, c.exchange_segment, c.security_id,
+                        CAST(c.{k} AS TIMESTAMP), ?, {olds}, {nulls}, ?, c.provider, NULL FROM {t} c WHERE {gone}""",
                                 [job_id, "removed" if prune else "missing_kept", now] + ident + rng)
-                # ---- then the changes themselves
-                if changed:
+                # ---- then the changes themselves (fill-only mode keeps every stored candle: it only adds the missing ones)
+                if changed and not fill_only:
                     con.execute(f"""UPDATE {t} SET open = s.open, high = s.high, low = s.low, close = s.close,
-                        volume = s.volume, epoch_raw = s.epoch_raw, ingested_at_utc = ? FROM rstage s
+                        volume = s.volume, epoch_raw = s.epoch_raw, ingested_at_utc = ?, provider = ? FROM rstage s
                         WHERE {t}.exchange_segment = s.exchange_segment AND {t}.security_id = s.security_id
-                        AND {t}.{k} = {key_s} AND ({differs_for(t)})""", [now])
+                        AND {t}.{k} = {key_s} AND ({differs_for(t)})""", [now, prov])
                 if added:
                     wid = db._window_id(inst, w)
                     con.execute(f"""INSERT INTO {t} (exchange_segment, security_id, {k}, open, high, low, close, volume,
-                        epoch_raw, window_id, ingested_at_utc)
+                        epoch_raw, window_id, ingested_at_utc, provider)
                         SELECT s.exchange_segment, s.security_id, {key_s}, s.open, s.high, s.low, s.close, s.volume,
-                               s.epoch_raw, ?, ? FROM rstage s WHERE NOT EXISTS (SELECT 1 FROM {t} c WHERE {join})
-                        ON CONFLICT DO NOTHING""", [wid, now])
+                               s.epoch_raw, ?, ?, ? FROM rstage s WHERE NOT EXISTS (SELECT 1 FROM {t} c WHERE {join})
+                        ON CONFLICT DO NOTHING""", [wid, now, prov])
                     db._upsert_window(wid, inst, w, status="complete", attempts=attempts, received=v.n, inserted=added,
                                       flagged=int(v.anomalies["candle_key"].nunique()), revised=changed,
                                       zero_volume=v.zero_volume_rows, http_status=http_status, error_code=None,
-                                      error_message=None, now=now)
+                                      error_message=None, now=now, provider=prov)
                 removed = 0
                 if prune and missing:
                     con.execute(f"""DELETE FROM {t} WHERE exchange_segment = ? AND security_id = ? AND {span_plain}
@@ -307,7 +338,7 @@ class Refresher:
             finally:
                 con.unregister("rstage")
                 con.unregister("ran")
-            status = "replaced" if (changed or added or removed) else "unchanged"
+            status = "replaced" if ((changed and not fill_only) or added or removed) else "unchanged"
             self._set(job_id, w, status, attempts, http_status, old_n, v.n, changed, added, missing, removed, now)
             con.commit()
         except Exception:

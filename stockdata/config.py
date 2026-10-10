@@ -69,6 +69,8 @@ class Settings:
     max_requests_per_run: int = DEFAULT_MAX_PER_RUN
     max_requests_per_day: int = DEFAULT_MAX_PER_DAY   # IST calendar day, all downloaders of this application
     ledger_path: Path | None = None                    # shared usage ledger; resolved once in from_env
+    provider: str = "dhan"                             # default data provider (STOCKDATA_PROVIDER); a command's --provider wins
+    rps_override: float | None = None                  # STOCKDATA_RPS when explicitly set: scales the limits of ANY provider
 
     @property
     def request_ledger_path(self) -> Path:
@@ -107,6 +109,8 @@ class Settings:
             max_requests_per_run=per_run,
             max_requests_per_day=per_day,
             ledger_path=Path(env("STOCKDATA_LEDGER") or folder / "request_ledger.sqlite"),
+            provider=(env("STOCKDATA_PROVIDER") or "dhan").lower(),
+            rps_override=float(env("STOCKDATA_RPS")) if env("STOCKDATA_RPS") else None,
         )
 
     def require_token(self) -> str:

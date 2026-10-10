@@ -22,19 +22,23 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from stockdata import jobcontrol
-from stockdata.budget import COUNTER_CAVEAT, DHAN_DOCUMENTED_DAILY_LIMIT, read_usage, validate_limits
+from stockdata.budget import DHAN_DOCUMENTED_DAILY_LIMIT, counter_caveat, read_usage, validate_limits
+from stockdata.providers import PROVIDER_NAMES, get_provider
+from stockdata import live
 from stockdata.db import CandleDB
+from stockdata.downloader import select_instruments
 from stockdata.plan import PlanError, build_download_plan
+from stockdata.refresh import Refresher, RefreshOptions
 from stockdata.timeframes import get_timeframe
-from stockdata.timeutil import IST
+from stockdata.timeutil import IST, cutoff_exclusive, to_midnight
 from stockdata.web import jobs as J
-from stockdata.web.credentials import CredentialStore
+from stockdata.web.credentials import CredentialStore, all_provider_keys
 from stockdata.web.data import DataAccess, DatabaseMissing, DbGate
 from stockdata.web.process import free_bytes, hard_kill, is_alive, spawn_detached
 import psutil
 from stockdata.web.redact import redact
 from stockdata.web.settings import WebSettings
-from stockdata.web.store import ACTIVE, FINISHED_OK, RESUMABLE, Store, now
+from stockdata.web.store import ACTIVE, FINISHED_OK, RESUMABLE, TERMINAL, Store, now
 
 log = logging.getLogger("stockdata.web.supervisor")
 
@@ -42,6 +46,9 @@ TICK_SECONDS = 2.0
 STALE_AFTER = 120            # seconds without a heartbeat from a live worker
 MIN_FREE_BYTES = 2 * 1024 ** 3
 PARALLEL_RPS = 2.0           # each worker's rate when daily and 15-minute run side by side (2 + 2 < Dhan's 5/s)
+LIVE_RPS = 1.5               # a live update runs beside a historical download (3 + 1.5 < Dhan's 5/s); other providers: 20% of their rate
+LIVE_RATE_FRACTION = 0.2
+DEFAULT_LIVE_RESERVE = 2_000 # requests per day a historical job leaves untouched so live updates can always run
 DEFAULT_BYTES_PER_ROW = 80   # synthetic benchmark: 77 bytes/row at 14.4 M rows (no real-data evidence yet)
 DAILY_ROWS_UPPER = 6_300     # largest real daily history seen: 6,159 candles (RELIANCE, 2002 -> 2026)
 INTRADAY_ROWS_PER_WINDOW = 1_650   # 89 days x ~26 bars; real 89-day windows returned about 1,527
@@ -76,7 +83,45 @@ class Supervisor:
             "max_per_day": g("max_per_day", eng.max_requests_per_day),
             "parallel_timeframes": g("parallel_timeframes", False), "queue_enabled": g("queue_enabled", True),
             "auto_resume_budget": g("auto_resume_budget", False), "min_free_gb": g("min_free_gb", 5),
+            "provider_default": g("provider_default", eng.provider or "dhan"),
+            "provider_by_timeframe": g("provider_by_timeframe", {}) or {},
+            "live_reserve": g("live_reserve", DEFAULT_LIVE_RESERVE),
+            "provider_limits": g("provider_limits", {}) or {},
         }
+
+    # ------------------------------------------------------------------ providers
+    def default_provider(self, timeframe: str | None = None) -> str:
+        eff = self.effective()
+        return eff["provider_by_timeframe"].get(timeframe) or eff["provider_default"]
+
+    def provider_limits(self, provider: str) -> dict:
+        """Per-run and per-IST-day request caps for one provider. Each provider has its own account-wide limits."""
+        eff = self.effective()
+        saved = eff["provider_limits"].get(provider) or {}
+        cap = get_provider(provider).capabilities().rate_limit
+        if provider == "dhan":
+            per_day, per_run = saved.get("per_day", eff["max_per_day"]), saved.get("per_run", eff["max_per_run"])
+        else:
+            per_day = saved.get("per_day") or cap.operating_day_cap or eff["max_per_day"]
+            per_run = saved.get("per_run") or min(eff["max_per_run"], per_day)
+        return {"per_run": int(per_run), "per_day": int(per_day)}
+
+    def provider_ready(self, provider: str) -> str | None:
+        """None when the provider's credentials look usable, otherwise why not (offline: nothing is contacted)."""
+        if provider == "dhan":                                   # the long-standing wording, kept exactly
+            st = self.creds.status()
+            if not st["ready"]:
+                return "Dhan credentials are not configured (Settings -> Credentials)"
+            if st["access_token"].get("expired"):
+                return "the Dhan access token has expired (Settings -> Credentials)"
+            return None
+        auth = self.creds.provider_status(provider)["auth"]
+        label = get_provider(provider).label
+        if auth["state"] == "not_configured":
+            return f"{label} credentials are not configured (Providers screen)"
+        if auth["state"] == "expired":
+            return f"the {label} token has expired (Providers screen): ACTION REQUIRED"
+        return None
 
     def update_settings(self, **changes) -> dict:
         """Change settings. Only the values being changed are validated, so switching the queue on or off keeps working
@@ -91,6 +136,28 @@ class Supervisor:
                 raise JobError(str(exc), 400)
         if "rps" in changed and not 0 < float(cur["rps"]) <= 5:
             raise JobError("requests per second must be above 0 and at most Dhan's documented 5", 400)
+        if "provider_default" in changed and changed["provider_default"] not in PROVIDER_NAMES:
+            raise JobError(f"unknown provider {changed['provider_default']!r}", 400)
+        if "provider_by_timeframe" in changed:
+            from stockdata.timeframes import TIMEFRAMES
+            for tf_name, prov in changed["provider_by_timeframe"].items():
+                if tf_name not in TIMEFRAMES or prov not in PROVIDER_NAMES:
+                    raise JobError(f"invalid provider choice for {tf_name!r}: {prov!r}", 400)
+                if not get_provider(prov).supports(TIMEFRAMES[tf_name]):
+                    raise JobError(f"{get_provider(prov).label} does not provide {tf_name} candles", 400)
+        if "live_reserve" in changed and int(changed["live_reserve"]) < 0:
+            raise JobError("the live reserve cannot be negative", 400)
+        if "provider_limits" in changed:
+            for prov, lim in changed["provider_limits"].items():
+                if prov not in PROVIDER_NAMES:
+                    raise JobError(f"unknown provider {prov!r}", 400)
+                documented = get_provider(prov).capabilities().rate_limit.per_day
+                for key in ("per_day", "per_run"):
+                    if key in lim and int(lim[key]) < 1:
+                        raise JobError("request limits must be positive integers", 400)
+                if documented and int(lim.get("per_day", 0)) > documented:
+                    raise JobError(f"the per-day limit {int(lim['per_day']):,} exceeds {get_provider(prov).label}'s documented "
+                                   f"{documented:,} requests/day; refusing to configure it", 400)
         for k, v in changed.items():
             self.store.set_meta(k, v)
         self.store.audit("settings.update", None, changed)
@@ -98,10 +165,13 @@ class Supervisor:
         return self.effective()
 
     # ------------------------------------------------------------------ budget
-    def usage(self) -> dict:
+    def usage(self, provider: str | None = None) -> dict:
+        """The request budget of ONE provider (the default provider unless told otherwise) plus a short summary of all."""
         eff = self.effective()
+        provider = provider or self.default_provider("daily")
+        lim = self.provider_limits(provider)
         ledger = self.s.engine.request_ledger_path
-        today = read_usage(ledger)
+        today = read_usage(ledger, provider=provider)
         used = sum(today.values())
         now_ist = datetime.now(IST)
         reset = (now_ist + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -116,11 +186,17 @@ class Supervisor:
                 con.close()
             except Exception:
                 events = []
-        return {"ledger_path": str(ledger), "ledger_exists": ledger.exists(), "ist_day": now_ist.date().isoformat(),
-                "used_today": used, "by_label": today, "max_per_run": eff["max_per_run"], "max_per_day": eff["max_per_day"],
-                "remaining_day": max(0, eff["max_per_day"] - used), "resets_at_ist": reset.isoformat(timespec="minutes"),
-                "documented_account_limit": DHAN_DOCUMENTED_DAILY_LIMIT, "history": read_usage(ledger, history=7) or [],
-                "limit_events": events, "caveat": COUNTER_CAVEAT}
+        summary = {}
+        for name in PROVIDER_NAMES:
+            other = sum(read_usage(ledger, provider=name).values())
+            cap = self.provider_limits(name)["per_day"]
+            summary[name] = {"used_today": other, "max_per_day": cap, "remaining_day": max(0, cap - other)}
+        return {"provider": provider, "ledger_path": str(ledger), "ledger_exists": ledger.exists(), "ist_day": now_ist.date().isoformat(),
+                "used_today": used, "by_label": today, "max_per_run": lim["per_run"], "max_per_day": lim["per_day"],
+                "remaining_day": max(0, lim["per_day"] - used), "resets_at_ist": reset.isoformat(timespec="minutes"),
+                "documented_account_limit": get_provider(provider).capabilities().rate_limit.per_day or DHAN_DOCUMENTED_DAILY_LIMIT,
+                "history": read_usage(ledger, history=7, provider=provider) or [],
+                "limit_events": events, "caveat": counter_caveat(provider, get_provider(provider).label), "providers": summary}
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -204,7 +280,7 @@ class Supervisor:
     def _resolve_ids(self, spec: J.JobSpec) -> list[int] | None:
         """Validate the selection against the loaded universe; expand a saved group to security ids."""
         sel = spec.selection
-        if spec.kind != "download" or sel.mode == "all":
+        if spec.kind not in J.SESSION_KINDS or sel.mode == "all":
             return None
         master = self.data.instrument_master().get("rows", [])
         if not master:
@@ -233,34 +309,69 @@ class Supervisor:
                    actor: str = "ui") -> dict:
         with self._lock:
             ids = self._resolve_ids(spec)
+            if spec.kind in J.SESSION_KINDS:
+                # The provider is fixed when the job is CREATED: changing the default later never silently moves queued work
+                # to another source, and the job's provenance is explicit.
+                prov = spec.provider or self.default_provider(spec.timeframe)
+                adapter = get_provider(prov)
+                if not adapter.supports(get_timeframe(spec.timeframe)):
+                    raise JobError(f"{adapter.label} does not provide {spec.timeframe} candles", 400)
+                spec = spec.model_copy(update={"provider": prov})
             fp = J.fingerprint(spec, ids)
             if not allow_duplicate:
+                # only work that is still pending counts as "the same job": a FINISHED identical job (even one that completed
+                # with warnings) must not block today's update or a deliberate re-run
                 dup = self.store.one("SELECT id, status FROM jobs WHERE fingerprint = ? AND status NOT IN "
-                                     "('completed','cancelled')", (fp,))
+                                     "('completed','completed_with_warnings','cancelled')", (fp,))
                 if dup:
                     raise JobError(f"An identical job already exists: #{dup['id']} ({dup['status']}). Resume or edit that one "
                                    "instead of downloading the same work twice.", 409)
-            eff = self.effective()
-            args = J.engine_args(spec, data_dir=str(self.s.data_dir), security_ids=ids,
-                                 rps=eff["rps"] if spec.kind == "download" else None,
-                                 max_per_run=eff["max_per_run"] if spec.kind == "download" else None,
-                                 max_per_day=eff["max_per_day"] if spec.kind == "download" else None)
+            args = self._engine_args(spec, ids)
             minpos = self.store.one("SELECT COALESCE(MAX(queue_pos), 0) + 1 AS p FROM jobs")["p"]
             name = spec.name or J.default_name(spec, ids)
             options = {"spec": spec.model_dump(mode="json"), "security_ids": ids}
             cur = self.store.execute(
                 """INSERT INTO jobs (name, kind, timeframe, status, options, plan, command, campaign_id, campaign_pos,
-                   queue_pos, created_at, queued_at, fingerprint, source_job_id, windows_planned, instruments_total, not_before)
-                   VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   queue_pos, created_at, queued_at, fingerprint, source_job_id, windows_planned, instruments_total, not_before,
+                   provider, lane)
+                   VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (name, spec.kind, spec.timeframe, json.dumps(options), json.dumps(plan) if plan else None,
                  J.command_text(args), campaign_id, campaign_pos, minpos, now(), now(), fp, source_job_id,
                  plan.get("windows") if plan else None, plan.get("instruments") if plan else None,
-                 spec.start_after.isoformat(timespec="seconds") if spec.start_after else None))
+                 spec.start_after.isoformat(timespec="seconds") if spec.start_after else None,
+                 spec.provider, J.lane_of(spec.kind)))
             job_id = cur.lastrowid
             self.store.event(job_id, "created", f"job created by {actor}: {name}")
             self.store.audit("job.create", f"job:{job_id}", {"command": J.command_text(args), "canonical": J.canonical(spec, ids)})
             self.wake()
             return self.get(job_id)
+
+    def _engine_args(self, spec: J.JobSpec, ids: list[int] | None, *, rate: float | None = None) -> list[str]:
+        """The exact engine command of a job. Request limits are the PROVIDER's own; a historical job also leaves a reserve of
+        the day's requests untouched so a live update can always run; a live job runs gently beside a historical one."""
+        eff = self.effective()
+        if spec.kind not in J.SESSION_KINDS:
+            return J.engine_args(spec, data_dir=str(self.s.data_dir), security_ids=ids)
+        prov = spec.provider or "dhan"
+        lim = self.provider_limits(prov)
+        per_day = lim["per_day"]
+        if J.lane_of(spec.kind) == "historical":
+            per_day = max(1, per_day - int(eff["live_reserve"]))
+        if rate is None:
+            rate = self._rate_for(spec, prov)
+        return J.engine_args(spec, data_dir=str(self.s.data_dir), security_ids=ids, rps=rate,
+                             max_per_run=min(lim["per_run"], per_day), max_per_day=per_day)
+
+    def _rate_for(self, spec: J.JobSpec, prov: str) -> float | None:
+        eff = self.effective()
+        live = J.lane_of(spec.kind) == "live"
+        if prov == "dhan":
+            rps = eff["rps"]
+            if live:
+                return min(rps, LIVE_RPS)
+            return min(rps, PARALLEL_RPS) if eff["parallel_timeframes"] else rps
+        per_sec = get_provider(prov).capabilities().rate_limit.per_second or 1
+        return per_sec * LIVE_RATE_FRACTION if live else None        # historical: the adapter's own conservative default
 
     def spec_of(self, job: dict) -> J.JobSpec:
         return J.JobSpec.model_validate(json.loads(job["options"])["spec"])
@@ -271,7 +382,9 @@ class Supervisor:
         with self._lock:
             job = self.get(job_id)
             if job["status"] in ACTIVE:
-                raise JobError("job is already running", 409)
+                # Creating a job wakes the scheduler, which may start it before this explicit "start now" arrives; that is
+                # the outcome the person asked for, not an error.
+                return job, None
             if job["status"] not in ("queued", *RESUMABLE):
                 raise JobError(f"a {job['status']} job cannot be started", 409)
             front = self.store.one("SELECT COALESCE(MIN(queue_pos), 1) - 1 AS p FROM jobs")["p"]
@@ -289,6 +402,8 @@ class Supervisor:
             job = self.get(job_id)
             if job["status"] not in RESUMABLE:
                 raise JobError(f"only paused, interrupted, stopped or failed jobs can be resumed (this one is {job['status']})", 409)
+            if job.get("yielded_to"):
+                self._set(job_id, yielded_to=None)
             front = self.store.one("SELECT COALESCE(MIN(queue_pos), 1) - 1 AS p FROM jobs")["p"]
             self._set(job_id, status="queued", queue_pos=front, queued_at=now(), pending_action=None, block_reason=None)
             self.store.event(job_id, "resumed", "resume requested; the same command continues from the last committed window")
@@ -382,8 +497,8 @@ class Supervisor:
         DH-907 windows as empty). Nothing else changes: completed windows are never requested again."""
         with self._lock:
             job = self.get(job_id)
-            if job["kind"] != "download":
-                raise JobError("only download jobs have failed windows to retry", 400)
+            if job["kind"] not in ("download", "update"):
+                raise JobError("only download and update jobs have failures to retry", 400)
             spec = self.spec_of(job)
             sel = spec.selection
             if security_ids:
@@ -392,10 +507,10 @@ class Supervisor:
                                           "empty_error_codes": empty_error_codes or [],
                                           "confirm_full": confirm_full or spec.confirm_full})
             new = J.JobSpec.model_validate(new.model_dump(mode="json"))
-            return self.create_job(new, source_job_id=job_id, actor="retry")
+            return self.create_job(new, source_job_id=job_id, actor="retry", allow_duplicate=True)
 
     # ------------------------------------------------------------------ scheduling
-    def _blocked_reason(self, job: dict, *, honour_queue_switch: bool = True) -> str | None:
+    def _blocked_reason(self, job: dict, *, honour_queue_switch: bool = True, ignore_historical_writers: bool = False) -> str | None:
         eff = self.effective()
         if honour_queue_switch and not eff["queue_enabled"]:
             return "queue processing is switched off"
@@ -414,6 +529,7 @@ class Supervisor:
                 if prev["status"] not in ok:
                     return f"campaign order: waiting for job #{prev['id']} ({prev['status']})"
         active = self._active_jobs()
+        lane = J.lane_of(job["kind"])
         if job["kind"] == "instruments_load":
             if active:
                 return f"waiting for running job #{active[0]['id']} to finish (the instrument master update writes both databases)"
@@ -422,28 +538,63 @@ class Supervisor:
                 if a["kind"] == "instruments_load":
                     return "the instrument master is being updated"
                 if a["timeframe"] == job["timeframe"]:
+                    if ignore_historical_writers and J.lane_of(a["kind"]) == "historical":
+                        continue
                     return f"job #{a['id']} is writing the {job['timeframe']} database (one writer per database)"
-            limit = 2 if eff["parallel_timeframes"] else 1
-            if len(active) >= limit:
-                return f"waiting for job #{active[0]['id']} (parallel timeframes are off, so downloads run one at a time)"
-        if job["kind"] == "download":
-            st = self.creds.status()
-            if not st["ready"]:
-                return "Dhan credentials are not configured (Settings -> Credentials)"
-            if st["access_token"].get("expired"):
-                return "the Dhan access token has expired (Settings -> Credentials)"
-            if self.usage()["remaining_day"] <= 0:
-                return "the daily request budget is used up (resets at IST midnight)"
+            # each lane has its own allowance: a long historical backfill never occupies the live lane's slot
+            same_lane = [a for a in active if J.lane_of(a["kind"]) == lane and not (ignore_historical_writers and lane == "historical")]
+            limit = 2 if (eff["parallel_timeframes"] and lane == "historical") else 1
+            if len(same_lane) >= limit:
+                what = "live updates" if lane == "live" else "downloads"
+                return f"waiting for job #{same_lane[0]['id']} ({what} run one at a time in their lane)"
+        if job["kind"] in J.SESSION_KINDS:
+            prov = job.get("provider") or "dhan"
+            problem = self.provider_ready(prov)
+            if problem:
+                return problem
+            if self.usage(prov)["remaining_day"] <= 0:
+                return ("the daily request budget is used up (resets at IST midnight)" if prov == "dhan"
+                        else f"the daily request budget for {get_provider(prov).label} is used up (resets at IST midnight)")
         if free_bytes(self.s.data_dir) < max(MIN_FREE_BYTES, int(eff["min_free_gb"] * 1024 ** 3) // 2):
             return "not enough free disk space"
         return None
 
     def _eligible_queue(self) -> list[dict]:
-        return self.store.all("SELECT * FROM jobs WHERE status = 'queued' ORDER BY queue_pos, id")
+        queued = self.store.all("SELECT * FROM jobs WHERE status = 'queued' ORDER BY queue_pos, id")
+        return sorted(queued, key=lambda j: 0 if J.lane_of(j["kind"]) == "live" else 1)       # live updates are looked at first
+
+    def _yield_for_live(self, job: dict) -> bool:
+        """A live job that only waits for a HISTORICAL writer on its database asks that job to pause at its next checkpoint;
+        the historical job resumes by itself when the live job is done. Returns True when a pause was requested."""
+        if J.lane_of(job["kind"]) != "live" or self._blocked_reason(job, ignore_historical_writers=True) is not None:
+            return False
+        asked = False
+        for a in self._active_jobs():
+            if (a["timeframe"] == job["timeframe"] and J.lane_of(a["kind"]) == "historical" and a["status"] in ("preparing", "running")):
+                try:
+                    self.pause(a["id"], actor="scheduler")
+                except JobError:
+                    continue
+                self._set(a["id"], yielded_to=job["id"])
+                self.store.event(a["id"], "yielded", f"pausing at the next checkpoint to let live update #{job['id']} run; it resumes automatically afterwards")
+                asked = True
+        if asked:
+            self._set(job["id"], block_reason="waiting for a historical download to pause at a checkpoint (live updates take priority)")
+        return asked
+
+    def _resume_yielded(self) -> None:
+        for j in self.store.all("SELECT * FROM jobs WHERE yielded_to IS NOT NULL AND status = 'paused'"):
+            live = self.store.one("SELECT status FROM jobs WHERE id = ?", (j["yielded_to"],))
+            if live is None or live["status"] not in ("queued",) + ACTIVE:
+                other = j["yielded_to"]
+                self._set(j["id"], yielded_to=None)
+                self.resume(j["id"])
+                self.store.event(j["id"], "auto_resumed", f"resumed automatically: live update #{other} is no longer running")
 
     def tick(self) -> None:
         with self._lock:
             self._reap()
+            self._resume_yielded()
             eff = self.effective()
             if eff["auto_resume_budget"]:
                 today = datetime.now(IST).date().isoformat()
@@ -456,6 +607,8 @@ class Supervisor:
                 reason = self._blocked_reason(job)
                 if reason is None:
                     reason = self._try_start(job)
+                elif self._yield_for_live(job):
+                    continue
                 if reason != job["block_reason"]:
                     self._set(job["id"], block_reason=reason)
 
@@ -478,20 +631,14 @@ class Supervisor:
     def _spawn(self, job: dict) -> str | None:
         spec = self.spec_of(job)
         ids = json.loads(job["options"]).get("security_ids")
-        eff = self.effective()
         seq = job["runs"] + 1
         run_dir = self.s.jobs_dir / str(job["id"]) / f"run_{seq}"
         run_dir.mkdir(parents=True, exist_ok=True)
-        rps = eff["rps"]
-        if eff["parallel_timeframes"]:
-            rps = min(rps, PARALLEL_RPS)
-        args = J.engine_args(spec, data_dir=str(self.s.data_dir), security_ids=ids,
-                             rps=rps if spec.kind == "download" else None,
-                             max_per_run=eff["max_per_run"] if spec.kind == "download" else None,
-                             max_per_day=eff["max_per_day"] if spec.kind == "download" else None)
+        args = self._engine_args(spec, ids)
         argv = [sys.executable, "-m", "stockdata.web.worker", "--control-dir", str(run_dir), "--", *args]
-        env = {k: v for k, v in os.environ.items() if k not in ("DHAN_ACCESS_TOKEN", "DHAN_CLIENT_ID", jobcontrol.ENV_VAR)}
-        env.update(self.creds.resolve())
+        env = {k: v for k, v in os.environ.items() if k not in (*all_provider_keys(), jobcontrol.ENV_VAR)}
+        if spec.kind in J.SESSION_KINDS:                                  # a worker gets ONLY its own provider's credentials
+            env.update(self.creds.provider_env(spec.provider or "dhan"))
         env.update({"PYTHONUNBUFFERED": "1", "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"})
         log_path = run_dir / "worker.log"
         try:
@@ -671,7 +818,16 @@ class Supervisor:
                                     "source_job_id")}
         spec = self.spec_of(job)
         sel = spec.selection
+        session_kind = job["kind"] in J.SESSION_KINDS
         view.update({
+            "provider": (job.get("provider") or "dhan") if session_kind else None,
+            "lane": job.get("lane") or J.lane_of(job["kind"]),
+            "workflow": {"download": "Historical download", "refresh": "Historical repair", "instruments_load": "Instrument master",
+                         "update": "Live update (post-close)", "poll": "Live polling (current session)"}[job["kind"]],
+            "yielded_to": job.get("yielded_to"),
+            "live": ({"overlap_days": spec.overlap_days, "seed_days": spec.seed_days, "poll_seconds": spec.poll_seconds,
+                      "max_cycles": spec.max_cycles} if job["kind"] in J.LIVE_KINDS else None),
+            "allow_cross_provider": spec.allow_cross_provider if job["kind"] == "refresh" else None,
             "scheduled_for": job["not_before"] if job["status"] == "queued" else None,
             "selection": None if sel is None else {"mode": sel.mode, "count": None if sel.mode == "all" else
                          (len(sel.symbols) if sel.mode == "symbols" else len(json.loads(job["options"]).get("security_ids") or [])),
@@ -701,8 +857,10 @@ class Supervisor:
                 "interrupted": ["resume", "start", "abandon"], "stopped": ["resume", "start", "abandon"],
                 "stopped_by_limit": ["resume", "start", "abandon"], "failed": ["resume", "start", "abandon"],
                 "completed_with_warnings": ["retry_failed", "delete"], "completed": ["delete"], "cancelled": ["delete"]}[s]
-        if job["kind"] == "download" and s in ("failed", "interrupted", "stopped", "paused") and (job["failed_windows"] or job["retriable_windows"]):
+        if job["kind"] in ("download", "update") and s in ("failed", "interrupted", "stopped", "paused") and (job["failed_windows"] or job["retriable_windows"]):
             acts = acts + ["retry_failed"]
+        if job["kind"] not in ("download", "update"):
+            acts = [a for a in acts if a != "retry_failed"]
         return acts
 
     # ------------------------------------------------------------------ logs
@@ -736,108 +894,219 @@ class Supervisor:
 
     # ------------------------------------------------------------------ plan preview
     def preview(self, spec: J.JobSpec) -> dict:
-        """Run the engine's own planner (read-only) and add budget, duration, disk and conflict information."""
-        eff = self.effective()
-        if spec.kind != "download":
-            raise JobError("only downloads have a request plan", 400)
+        """The engine's own planner (read-only) for any job kind, plus budget, duration, disk and conflict information."""
+        if spec.kind not in J.SESSION_KINDS:
+            raise JobError("only downloads, updates, polls and repairs have a request plan", 400)
         ids = self._resolve_ids(spec)
         tf = get_timeframe(spec.timeframe)
+        prov = spec.provider or self.default_provider(spec.timeframe)
+        adapter = get_provider(prov)
+        if not adapter.supports(tf):
+            raise JobError(f"{adapter.label} does not provide {spec.timeframe} candles", 400)
+        spec = spec.model_copy(update={"provider": prov})
         path = self.data.path(spec.timeframe)
         if not path.exists():
             raise DatabaseMissing(f"The {spec.timeframe} database does not exist yet ({path}). Load the instrument master first "
                                   "(Instruments page -> Refresh instrument master).")
         sel = spec.selection
+        extra: dict = {}
         with self.gate.reader(spec.timeframe):
             with CandleDB(tf, path, read_only=True) as db:
                 try:
-                    plan = build_download_plan(
-                        db, settings=self.s.engine, symbols=sel.symbols if sel.mode == "symbols" else None,
-                        security_ids=ids if sel.mode in ("security_ids", "group") else None,
-                        select_all=sel.mode == "all", limit=sel.limit, start_date=spec.start_date, end_date=spec.end_date,
-                        retry_failed=spec.retry_failed, empty_error_codes=frozenset(spec.empty_error_codes),
-                        persist_history_start=False)
+                    if spec.kind == "download":
+                        plan = build_download_plan(
+                            db, settings=self.s.engine, symbols=sel.symbols if sel.mode == "symbols" else None,
+                            security_ids=ids if sel.mode in ("security_ids", "group") else None,
+                            select_all=sel.mode == "all", limit=sel.limit, start_date=spec.start_date, end_date=spec.end_date,
+                            retry_failed=spec.retry_failed, empty_error_codes=frozenset(spec.empty_error_codes),
+                            persist_history_start=False, provider=prov, foreign_empty_is_gap=spec.fill_provider_gaps)
+                        requests, instruments, with_work = plan.requests, len(plan.instruments), plan.instruments_with_work
+                        opts = plan.opts
+                        extra = {"resolved_start": f"{opts.history_start:%Y-%m-%d}", "end_exclusive": f"{opts.cutoff:%Y-%m-%d}",
+                                 "window_days": opts.window_days, "skipped_failed": plan.skipped_failed, "notes": plan.notes,
+                                 "unmapped": [i.symbol for i in plan.unmapped][:20], "unmapped_count": len(plan.unmapped),
+                                 "clamped_from": f"{plan.clamped_from:%Y-%m-%d}" if plan.clamped_from else None,
+                                 "sample": [{"symbol": p.instrument.symbol, "security_id": p.instrument.security_id, "windows": p.requests,
+                                             "first_from": f"{p.windows[-1].start:%Y-%m-%d}" if p.windows else None,
+                                             "last_to": f"{p.windows[0].end:%Y-%m-%d}" if p.windows else None} for p in plan.per_instrument[:15]]}
+                        rows_upper = (plan.instruments_with_work * DAILY_ROWS_UPPER if tf.name == "daily"
+                                      else requests * INTRADAY_ROWS_PER_WINDOW)
+                    elif spec.kind == "update":
+                        insts = select_instruments(db, symbols=sel.symbols if sel.mode == "symbols" else None,
+                                                   security_ids=ids if sel.mode in ("security_ids", "group") else None,
+                                                   select_all=sel.mode == "all", limit=sel.limit)
+                        uplan = live.plan_update(db, adapter, insts, live.UpdateOptions(
+                            provider=prov, overlap_days=spec.overlap_days if spec.overlap_days is not None else live.config.DEFAULT_OVERLAP_DAYS,
+                            seed_days=spec.seed_days, retry_failed=spec.retry_failed))
+                        requests, instruments, with_work = uplan.requests, len(insts), len(uplan.to_update)
+                        extra = {"end_exclusive": f"{uplan.cutoff:%Y-%m-%d}", "update": uplan.summary(), "notes": uplan.notes,
+                                 "window_days": adapter.window_days(tf),
+                                 "needs_backfill": [i.symbol for i in uplan.needs_backfill][:20],
+                                 "unmapped": [i.symbol for i in uplan.unmapped][:20], "unmapped_count": len(uplan.unmapped)}
+                        rows_upper = requests * (INTRADAY_ROWS_PER_WINDOW if tf.is_intraday else 40)
+                    elif spec.kind == "poll":
+                        insts = select_instruments(db, symbols=sel.symbols if sel.mode == "symbols" else None,
+                                                   security_ids=ids if sel.mode in ("security_ids", "group") else None,
+                                                   select_all=sel.mode == "all", limit=sel.limit)
+                        mapped = [i for i in insts if adapter.map_instrument(i) is not None]
+                        cycles = int(((live.CLOSE_GRACE_MINUTES + 375) * 60) / spec.poll_seconds) + 1
+                        cycles = min(cycles, spec.max_cycles) if spec.max_cycles else cycles
+                        requests, instruments, with_work = len(mapped) * cycles, len(insts), len(mapped)
+                        extra = {"per_cycle": len(mapped), "cycles": cycles, "poll_seconds": spec.poll_seconds,
+                                 "unmapped": [i.symbol for i in insts if i not in mapped][:20],
+                                 "unmapped_count": len(insts) - len(mapped),
+                                 "notes": ["Provisional bars only: repeated polling of delayed historical candles, not a live stream. "
+                                           "The canonical candles stay final-only."]}
+                        rows_upper = len(mapped) * 30
+                    else:  # refresh
+                        insts = select_instruments(db, symbols=sel.symbols if sel.mode == "symbols" else None,
+                                                   security_ids=ids if sel.mode in ("security_ids", "group") else None, select_all=False)
+                        start = to_midnight(spec.start_date)
+                        cutoff = cutoff_exclusive(datetime.now(IST), live.config.FINALIZE_AFTER_HOUR_IST)
+                        end = to_midnight(spec.end_date) if spec.end_date else cutoff
+                        if end > cutoff:
+                            raise JobError(f"the end date is later than the last final day boundary {cutoff:%Y-%m-%d} (exclusive)", 400)
+                        days = adapter.window_days(tf)
+                        first = adapter.earliest(tf)
+                        if first is not None and start < to_midnight(first):
+                            raise JobError(f"{adapter.label} serves {tf.name} candles only from {first}; choose a later start", 400)
+                        ropts = RefreshOptions(start=start, end=end, window_days=days, provider=prov,
+                                               allow_cross_provider=spec.allow_cross_provider, retry_failed=spec.retry_failed,
+                                               fill_only=spec.refresh_mode == "fill_gaps")
+                        requests = 0
+                        for i in insts:
+                            requests += len(Refresher(db, None, provider=adapter).plan(i, ropts)[1])
+                        instruments, with_work = len(insts), len(insts)
+                        extra = {"resolved_start": f"{start:%Y-%m-%d}", "end_exclusive": f"{end:%Y-%m-%d}", "window_days": days,
+                                 "notes": (["Fill gaps: the range is re-requested and only candles that are MISSING are added. A stored candle is never "
+                                            "replaced; where the provider's value differs the difference is recorded as a disagreement."]
+                                           if spec.refresh_mode == "fill_gaps" else
+                                           ["A repair re-requests the range and REPLACES stored candles that differ, after validating the "
+                                            "response; every replaced value is kept in the audit trail."])}
+                        rows_upper = requests * (INTRADAY_ROWS_PER_WINDOW if tf.is_intraday else DAILY_ROWS_UPPER)
                 except (PlanError, SystemExit) as exc:
                     raise JobError(str(exc), 400)
                 stored_pin = db.get_meta("history_start") if tf.is_intraday else None
                 db_rows = db.con.execute(f"SELECT count(*) FROM {tf.table}").fetchone()[0]
-        opts = plan.opts
-        requests = plan.requests
-        rps = min(eff["rps"], PARALLEL_RPS) if eff["parallel_timeframes"] else eff["rps"]
-        usage = self.usage()
-        room = min(eff["max_per_run"], usage["remaining_day"])
-        # disk
+        return self._finish_preview(spec, adapter, tf, path, requests, instruments, with_work, rows_upper, db_rows, stored_pin,
+                                    ids, extra)
+
+    def _finish_preview(self, spec, adapter, tf, path, requests, instruments, with_work, rows_upper, db_rows, stored_pin, ids, extra) -> dict:
+        eff = self.effective()
+        prov = adapter.name
+        lane = J.lane_of(spec.kind)
+        lim = self.provider_limits(prov)
+        caps = adapter.capabilities()
+        rps = self._rate_for(spec, prov)
+        if prov == "dhan":
+            rps = rps or eff["rps"]
+            sustained = rps
+        else:
+            sustained = caps.rate_limit.sustained_per_second(LIVE_RATE_FRACTION if lane == "live" else 0.6)
+        usage = self.usage(prov)
+        reserve = int(eff["live_reserve"]) if lane == "historical" else 0
+        room = max(0, min(lim["per_run"], usage["remaining_day"] - reserve))
         bytes_per_row, basis = DEFAULT_BYTES_PER_ROW, "synthetic benchmark of 77 bytes/row (no real-data evidence yet)"
         info = self.data.file_info(spec.timeframe)
         if db_rows >= 1_000_000:
             bytes_per_row = max(1, info["size_bytes"] // db_rows)
             basis = f"this database: {info['size_bytes']:,} bytes / {db_rows:,} rows"
-        if spec.timeframe == "daily":
-            rows_upper = plan.instruments_with_work * DAILY_ROWS_UPPER
-            rows_basis = f"at most {DAILY_ROWS_UPPER:,} candles per instrument (largest history seen: 6,159)"
-        else:
-            rows_upper = requests * INTRADAY_ROWS_PER_WINDOW
-            rows_basis = f"at most {INTRADAY_ROWS_PER_WINDOW:,} candles per 89-day window (real windows returned ~1,527)"
+        rows_basis = ("at most 6,300 candles per instrument (largest history seen: 6,159)" if tf.name == "daily" and spec.kind == "download"
+                      else f"at most {INTRADAY_ROWS_PER_WINDOW:,} candles per window")
         est_bytes = int(rows_upper * bytes_per_row * 1.3)
         free = free_bytes(self.s.data_dir)
         warnings: list[dict] = []
-        cred = self.creds.status()
-        if not cred["ready"]:
-            warnings.append({"level": "blocker", "type": "credentials", "message": "Dhan credentials are not configured (Settings -> Credentials). The job cannot start without them."})
-        elif cred["access_token"].get("expired"):
-            warnings.append({"level": "blocker", "type": "token_expired", "message": "The Dhan access token has expired. Update it before starting."})
-        elif cred["access_token"].get("seconds_left") is not None and requests / rps > cred["access_token"]["seconds_left"]:
+        cred = self.creds.status() if prov == "dhan" else None
+        problem = self.provider_ready(prov)
+        if problem:
+            expired = "expired" in problem
+            warnings.append({"level": "blocker", "type": "token_expired" if expired else "credentials",
+                             "message": (f"The {caps.label} credential has expired. Update it before starting." if prov != "dhan" and expired
+                                         else "The Dhan access token has expired. Update it before starting." if expired
+                                         else f"{caps.label} credentials are not configured ({'Settings -> Credentials' if prov == 'dhan' else 'Providers screen'}). "
+                                              "The job cannot start without them.")})
+        elif prov == "dhan" and cred["access_token"].get("seconds_left") is not None and sustained and requests / sustained > cred["access_token"]["seconds_left"]:
             warnings.append({"level": "warning", "type": "token_expiry",
                              "message": f"The access token expires in {cred['access_token']['seconds_left'] // 60} minutes, before this plan "
-                                        f"({int(requests / rps) // 60} minutes) can finish. The run will abort cleanly at expiry; update the token and Resume."})
+                                        f"({int(requests / sustained) // 60} minutes) can finish. The run will abort cleanly at expiry; update the token and Resume."})
+        if prov != "dhan" and caps.auth.interactive_login:
+            warnings.append({"level": "info", "type": "interactive_login",
+                             "message": f"{caps.label} needs a fresh login to renew its token, so a long or unattended run can stop for 'action required'."})
         if requests > room:
+            reserve_note = f", leaving {reserve:,} for live updates" if reserve else ""
             warnings.append({"level": "warning", "type": "budget",
-                             "message": f"The plan needs {requests:,} attempts but only {room:,} fit now (per-run cap {eff['max_per_run']:,}, "
-                                        f"{usage['remaining_day']:,} left today). It will stop safely at the limit and can be resumed later."})
+                             "message": f"The plan needs {requests:,} attempts but only {room:,} fit now (per-run cap {lim['per_run']:,}, "
+                                        f"{usage['remaining_day']:,} left today{reserve_note}). It will stop safely at the limit and can be resumed later."})
         if free < est_bytes * 2:
             warnings.append({"level": "warning" if free > est_bytes else "blocker", "type": "disk",
                              "message": f"Free disk {free / 1e9:.1f} GB vs a conservative estimate of {est_bytes / 1e9:.1f} GB of new data (keep 2x free)."})
-        active = [j for j in self._active_jobs() if j["timeframe"] == spec.timeframe or j["kind"] == "instruments_load"]
-        for a in active:
-            warnings.append({"level": "warning", "type": "writer_conflict",
-                             "message": f"Job #{a['id']} is currently writing the {spec.timeframe} database; a new job will wait for it."})
-        dup = self.store.one("SELECT id, status FROM jobs WHERE fingerprint = ? AND status NOT IN ('completed','cancelled')",
+        for a in [j for j in self._active_jobs() if j["timeframe"] == spec.timeframe or j["kind"] == "instruments_load"]:
+            same_lane = J.lane_of(a["kind"]) == lane
+            msg = (f"Job #{a['id']} is currently writing the {spec.timeframe} database; a new job will wait for it." if same_lane or lane == "historical"
+                   else f"Historical job #{a['id']} is writing the {spec.timeframe} database: it will be paused at its next checkpoint "
+                        "so this live update can run, then resumed automatically.")
+            warnings.append({"level": "warning" if same_lane or lane == "historical" else "info", "type": "writer_conflict", "message": msg})
+        dup = self.store.one("SELECT id, status FROM jobs WHERE fingerprint = ? AND status NOT IN ('completed','completed_with_warnings','cancelled')",
                              (J.fingerprint(spec, ids),))
         if dup:
             warnings.append({"level": "blocker", "type": "duplicate", "message": f"An identical job already exists: #{dup['id']} ({dup['status']})."})
         if not eff["queue_enabled"]:
             warnings.append({"level": "info", "type": "queue_off", "message": "Queue processing is switched off; queued jobs wait until you switch it on or use Start Now."})
-        if plan.skipped_failed:
+        if extra.get("skipped_failed"):
             warnings.append({"level": "info", "type": "skipped_failed",
-                             "message": f"{plan.skipped_failed:,} previously failed window(s) will be skipped (use retry-failed to include them)."})
-        if tf.is_intraday and stored_pin is None and not spec.start_date:
+                             "message": f"{extra['skipped_failed']:,} previously failed window(s) will be skipped (use retry-failed to include them)."})
+        if extra.get("unmapped_count"):
+            warnings.append({"level": "warning", "type": "unmapped",
+                             "message": f"{extra['unmapped_count']:,} instrument(s) have no {caps.label} identifier and are skipped "
+                                        f"({', '.join(extra['unmapped'][:5])}{'...' if extra['unmapped_count'] > 5 else ''}). "
+                                        + ("Load the DETAILED instrument master to get ISINs." if prov == "upstox" else "")})
+        for n in extra.get("notes", []):
+            warnings.append({"level": "info", "type": "note", "message": n})
+        if extra.get("clamped_from"):
+            warnings.append({"level": "warning", "type": "provider_range",
+                             "message": f"{caps.label} serves {tf.name} candles only from {caps.timeframes[tf.name].earliest_date}; the range "
+                                        f"starting {extra['clamped_from']} was shortened. Earlier dates are NOT requested from this provider: "
+                                        "choose another provider for them explicitly."})
+        if tf.is_intraday and spec.kind == "download" and stored_pin is None and not spec.start_date:
             warnings.append({"level": "info", "type": "history_pin",
-                             "message": f"The first real 15-minute run pins the history start at {opts.history_start:%Y-%m-%d} (five years before that run)."})
-        sample = [{"symbol": p.instrument.symbol, "security_id": p.instrument.security_id, "windows": p.requests,
-                   "first_from": f"{p.windows[-1].start:%Y-%m-%d}" if p.windows else None,
-                   "last_to": f"{p.windows[0].end:%Y-%m-%d}" if p.windows else None}
-                  for p in plan.per_instrument[:15]]
-        return {
-            "timeframe": spec.timeframe, "instruments": len(plan.instruments), "instruments_with_work": plan.instruments_with_work,
-            "windows": requests, "skipped_failed": plan.skipped_failed,
-            "resolved_start": f"{opts.history_start:%Y-%m-%d}", "end_exclusive": f"{opts.cutoff:%Y-%m-%d}",
+                             "message": f"The first real 15-minute run pins the history start at {extra.get('resolved_start')} (five years before that run)."})
+        facts = caps.timeframes[tf.name]
+        if facts.status != "probe_verified":
+            warnings.append({"level": "info", "type": "unverified_limits",
+                             "message": f"{caps.label}'s range cap / first date for {tf.name} candles are the provider's published values and have "
+                                        "not been verified from this installation (Providers -> Run capability probe)."})
+        if caps.adjustment_basis in ("unknown", "adjusted") and prov != "dhan":
+            warnings.append({"level": "info", "type": "adjustment_basis",
+                             "message": f"{caps.label}'s corporate-action adjustment basis is {caps.adjustment_basis} (unverified). Mixing providers "
+                                        "with different bases creates discontinuities; disagreements are recorded, never overwritten."})
+        out = {
+            "kind": spec.kind, "lane": lane, "provider": prov, "provider_label": caps.label, "timeframe": spec.timeframe,
+            "instruments": instruments, "instruments_with_work": with_work, "windows": requests,
+            "skipped_failed": extra.get("skipped_failed", 0),
+            "resolved_start": extra.get("resolved_start"), "end_exclusive": extra.get("end_exclusive"),
             "end_semantics": ("exclusive: the last candle requested is the day before this date; today's candles are included "
                               "only after the 18:00 IST finalisation boundary"),
-            "window_days": opts.window_days,
-            "window_note": ("one request per instrument covers the whole history" if spec.timeframe == "daily"
-                            else f"windows of at most {opts.window_days} days (the API caps intraday requests at 90)"),
-            "estimated_seconds": int(requests / rps) if rps else None,
-            "estimate_note": f"{requests:,} requests at {rps:g} requests/second, before retries and network latency; real runs take longer",
-            "rps": rps,
-            "budget": {"max_per_run": eff["max_per_run"], "max_per_day": eff["max_per_day"], "used_today": usage["used_today"],
-                       "remaining_day": usage["remaining_day"], "fits": requests <= room, "room_now": room,
-                       "resets_at_ist": usage["resets_at_ist"], "caveat": COUNTER_CAVEAT},
+            "window_days": extra.get("window_days"),
+            "window_note": ("one request per instrument covers the whole history" if spec.timeframe == "daily" and prov == "dhan" and spec.kind == "download"
+                            else f"windows of at most {extra.get('window_days')} days ({caps.label}'s own range cap for {tf.name} candles)"),
+            "estimated_seconds": int(requests / sustained) if sustained else None,
+            "estimate_note": (f"{requests:,} requests at {sustained:g} requests/second ({caps.label}'s binding limit), before retries and "
+                              "network latency; real runs take longer"),
+            "rps": sustained,
+            "budget": {"provider": prov, "max_per_run": lim["per_run"], "max_per_day": lim["per_day"], "used_today": usage["used_today"],
+                       "remaining_day": usage["remaining_day"], "live_reserve": reserve, "fits": requests <= room, "room_now": room,
+                       "resets_at_ist": usage["resets_at_ist"], "caveat": counter_caveat(prov, caps.label)},
             "disk": {"free_bytes": free, "estimated_new_bytes": est_bytes, "basis": f"{rows_basis}; {bytes_per_row} bytes/row from {basis}; x1.3 headroom",
                      "rows_upper_bound": rows_upper},
             "paths": {"data_dir": str(self.s.data_dir), "database": str(path), "ledger": usage["ledger_path"]},
             "warnings": warnings, "blockers": [w for w in warnings if w["level"] == "blocker"],
-            "sample": sample, "command": J.command_text(J.engine_args(spec, data_dir=str(self.s.data_dir), security_ids=ids,
-                                                                      rps=rps, max_per_run=eff["max_per_run"], max_per_day=eff["max_per_day"])),
+            "sample": extra.get("sample", []),
+            "command": J.command_text(self._engine_args(spec, ids)),
         }
+        for k in ("update", "per_cycle", "cycles", "poll_seconds", "needs_backfill"):
+            if k in extra:
+                out[k] = extra[k]
+        return out
 
     # ------------------------------------------------------------------ bulk and recovery operations
     def resume_eligible(self) -> list[dict]:

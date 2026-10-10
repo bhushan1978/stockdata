@@ -43,7 +43,8 @@ def test_flagged_sunday_session_passes_but_an_unflagged_weekend_candle_fails(tmp
         store(db, rows)
         c = check(db, "weekday, or flagged")
         assert c.ok and "1 flagged weekend candle" in c.detail
-        db.con.execute("INSERT INTO candles_daily SELECT exchange_segment, security_id, DATE '2024-05-12', open, high, low, "
+        db.con.execute("INSERT INTO candles_daily (exchange_segment, security_id, candle_date, open, high, low, close, volume, epoch_raw, "
+                       "window_id, ingested_at_utc) SELECT exchange_segment, security_id, DATE '2024-05-12', open, high, low, "
                        "close, volume, epoch_raw, window_id, ingested_at_utc FROM candles_daily LIMIT 1")   # a Sunday, never flagged
         assert not check(db, "weekday, or flagged").ok
 
@@ -56,8 +57,9 @@ def test_flagged_evening_bar_passes_but_an_unflagged_off_grid_bar_fails(tmp_path
         store(db, rows)
         c = check(db, "15-minute grid")
         assert c.ok and "1 flagged special-session bar" in c.detail
-        db.con.execute("INSERT INTO candles_15min SELECT exchange_segment, security_id, TIMESTAMP '2024-05-06 10:07:00', open, "
-                       "high, low, close, volume, epoch_raw, window_id, ingested_at_utc FROM candles_15min LIMIT 1")
+        db.con.execute("INSERT INTO candles_15min (exchange_segment, security_id, candle_timestamp, open, high, low, close, volume, "
+                       "epoch_raw, window_id, ingested_at_utc) SELECT exchange_segment, security_id, TIMESTAMP '2024-05-06 10:07:00', "
+                       "open, high, low, close, volume, epoch_raw, window_id, ingested_at_utc FROM candles_15min LIMIT 1")
         assert not check(db, "15-minute grid").ok
 
 

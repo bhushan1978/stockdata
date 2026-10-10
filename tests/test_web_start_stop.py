@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from argparse import Namespace
 from pathlib import Path
@@ -62,8 +63,11 @@ class App:
     def api(self, method, path, body=None, port=None):
         req = urllib.request.Request(f"http://127.0.0.1:{port or self.port}{path}", method=method, data=json.dumps(body).encode() if body is not None else None,
                                      headers={"Content-Type": "application/json", "X-StockData-UI": "1"})
-        with urllib.request.urlopen(req, timeout=20) as r:
-            return json.loads(r.read())
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as exc:                     # show the server's explanation, not just the status line
+            raise AssertionError(f"{method} {path} -> HTTP {exc.code}: {exc.read().decode('utf-8', 'replace')[:600]}") from None
 
     def info(self):
         return lifecycle.read_info(self.data / "web" / "server.json")

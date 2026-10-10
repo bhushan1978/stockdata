@@ -22,6 +22,7 @@ const pageSize = 100
 const data = ref<any>(null)
 const selected = ref<Set<any>>(new Set())
 const refreshOpen = ref(false)
+const masterKind = ref<'compact' | 'detailed'>('compact')
 const working = ref(false)
 const err = ref('')
 const lastMaster = ref<any>(null)
@@ -57,7 +58,7 @@ function toChart(r: InstrumentRow, tf: string) { void router.push({ path: '/expl
 async function refreshMaster() {
   working.value = true
   try {
-    const r = await api.post('/instruments/refresh', { confirm: true })
+    const r = await api.post('/instruments/refresh', { confirm: true, kind: masterKind.value })
     toast(r.waiting_reason ? 'Queued: ' + r.waiting_reason : 'Instrument master refresh started', 'ok', 7000)
     refreshOpen.value = false
     void router.push({ path: '/queue', query: { job: r.job.id } })
@@ -120,6 +121,8 @@ onMounted(() => { if (route.query.q) void refresh() })
 
     <ConfirmDialog :open="refreshOpen" title="Refresh the instrument master?" confirm-label="Fetch and load" check="I understand this rewrites the instrument tables of both databases" :busy="working" @cancel="refreshOpen = false" @confirm="refreshMaster">
       Runs <code>python -m stockdata instruments load --fetch</code>: it downloads Dhan's public instrument CSV (not an API data call, so it uses no request budget) and upserts the configured universe into both databases. Existing candles are untouched. It waits until no download is writing a database.
+      <div class="seg" style="margin-top:8px"><button :class="{ on: masterKind === 'compact' }" @click="masterKind = 'compact'">Compact (default)</button><button :class="{ on: masterKind === 'detailed' }" @click="masterKind = 'detailed'">Detailed (with ISINs)</button></div>
+      <div class="small muted" style="margin-top:4px">The detailed master carries ISINs. Upstox identifies instruments by ISIN, and ISINs also let the lifecycle report spot a company that is listed under two security ids. Dhan and FYERS work with the compact master.</div>
     </ConfirmDialog>
   </div>
 </template>

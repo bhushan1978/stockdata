@@ -21,6 +21,9 @@ const sid = ref<number | null>(route.query.sid ? Number(route.query.sid) : null)
 const symbol = ref('')
 const start = ref('')
 const end = ref('')
+// raw = the candles exactly as stored; adjusted = a separate view built from VERIFIED split/bonus events (optionally as known on a past date)
+const basis = ref<'raw' | 'adjusted'>(route.query.basis === 'adjusted' ? 'adjusted' : 'raw')
+const asOf = ref('')
 const data = ref<Candles | null>(null)
 const busy = ref<{ msg: string; kind: 'busy' | 'error' } | null>(null)
 const hover = ref<Bar | null>(null)
@@ -53,15 +56,16 @@ async function load(keepRange = false) {
   if (!sid.value) return
   loading.value = true; busy.value = null
   try {
-    const p: any = { timeframe: tf.value, security_id: sid.value }
+    const p: any = { timeframe: tf.value, security_id: sid.value, basis: basis.value }
     if (start.value) p.start = start.value
     if (end.value) p.end = end.value
+    if (basis.value === 'adjusted' && asOf.value) p.as_of = asOf.value
     data.value = await api.get('/candles', p)
     symbol.value = data.value!.symbol
     if (!keepRange && data.value!.n) { start.value = start.value || ''; }
     page.value = 1
     await loadTable()
-    void router.replace({ query: { tf: tf.value, sid: String(sid.value) } })
+    void router.replace({ query: { tf: tf.value, sid: String(sid.value), ...(basis.value === 'adjusted' ? { basis: 'adjusted' } : {}) } })
     jobs.value = (await api.get('/instruments/' + sid.value)).related_jobs
   } catch (e) {
     data.value = null; table.value = null
@@ -71,9 +75,10 @@ async function load(keepRange = false) {
 async function loadTable() {
   if (!sid.value) return
   try {
-    const p: any = { timeframe: tf.value, security_id: sid.value, page: page.value, page_size: pageSize.value, sort: sort.value, desc: desc.value }
+    const p: any = { timeframe: tf.value, security_id: sid.value, page: page.value, page_size: pageSize.value, sort: basis.value === 'adjusted' && PRICE_COLS.includes(sort.value) ? 'time' : sort.value, desc: desc.value, basis: basis.value }
     if (start.value) p.start = start.value
     if (end.value) p.end = end.value
+    if (basis.value === 'adjusted' && asOf.value) p.as_of = asOf.value
     table.value = await api.get('/candles/table', p)
   } catch { table.value = null }
 }
@@ -88,7 +93,23 @@ function shortcut(label: string) {
   void load(true)
 }
 function setTf(t: Timeframe) { tf.value = t; start.value = ''; end.value = ''; void load() }
-const exportUrl = computed(() => sid.value ? api.url('/candles/export.csv', { timeframe: tf.value, security_id: sid.value, start: start.value, end: end.value }) : '#')
+const PRICE_COLS = ['open', 'high', 'low', 'close', 'volume']
+const exportUrl = computed(() => sid.value ? api.url('/candles/export.csv', { timeframe: tf.value, security_id: sid.value, start: start.value, end: end.value, basis: basis.value, as_of: basis.value === 'adjusted' ? asOf.value : '' }) : '#')
+function setBasis(b: 'raw' | 'adjusted') { basis.value = b; if (sid.value) void load(true) }
+const isAdjusted = computed(() => data.value?.basis === 'adjusted')
+const noEvents = computed(() => isAdjusted.value && data.value?.adjustment?.status === 'no_verified_events')
+// gaps seen in the stored bars themselves: nothing is filled in, and a gap is not an error unless it was a trading session
+const gaps = computed<number[]>(() => {
+  const d = data.value
+  if (!d || d.n < 2) return []
+  const out: number[] = []
+  for (let i = 1; i < d.n; i++) {
+    const step = d.t[i] - d.t[i - 1]
+    if (tf.value === 'daily' ? step > 5 * 86400 : (step > 5 * 86400 || (step > 900 && Math.floor(d.t[i] / 86400) === Math.floor(d.t[i - 1] / 86400)))) out.push(d.t[i])
+  }
+  return out
+})
+const gapRows = computed(() => gaps.value.slice(0, 12).map((t) => { const i = data.value!.t.indexOf(t); return { from: when(data.value!.t[i - 1]), to: when(t) } }))
 const shown = computed<Bar | null>(() => {
   if (hover.value) return hover.value
   const d = data.value
@@ -101,9 +122,11 @@ const chg = computed(() => (shown.value && shown.value.prev ? ((shown.value.c - 
 const cols = [{ key: 'time', label: 'Time (IST)', sortable: true, mono: true }, { key: 'open', label: 'Open', sortable: true, align: 'right' as const, mono: true },
   { key: 'high', label: 'High', sortable: true, align: 'right' as const, mono: true }, { key: 'low', label: 'Low', sortable: true, align: 'right' as const, mono: true },
   { key: 'close', label: 'Close', sortable: true, align: 'right' as const, mono: true }, { key: 'volume', label: 'Volume', sortable: true, align: 'right' as const, mono: true },
+  { key: 'provider', label: 'Source' }, { key: 'revisions', label: 'Revisions', align: 'right' as const, mono: true },
   { key: 'epoch_raw', label: 'epoch_raw', align: 'right' as const, mono: true }, { key: 'window_id', label: 'Window', align: 'right' as const, mono: true }, { key: 'flags', label: 'Flags' }]
 function onSort(k: string, d: boolean) { sort.value = k; desc.value = d; page.value = 1; void loadTable() }
 watch(page, loadTable)
+watch(asOf, () => { if (basis.value === 'adjusted' && sid.value) void load(true) })
 onMounted(async () => {
   if (sid.value) { try { const d = await api.get('/instruments/' + sid.value); symbol.value = d.instrument.symbol; q.value = symbol.value } catch { /* ignore */ } await load() }
 })
@@ -111,11 +134,13 @@ onMounted(async () => {
 
 <template>
   <div>
-    <div class="page-head"><div><h1>Data Explorer</h1><p>Real stored candles, exactly as downloaded: nothing is filled in, adjusted or smoothed. Time axis is IST wall-clock.</p></div></div>
+    <div class="page-head"><div><h1>Data Explorer</h1><p>Real stored candles: nothing is filled in or smoothed. <b>Raw</b> shows them exactly as downloaded; <b>Adjusted</b> is a separate view with verified splits and bonus issues applied (never dividends), and is always labelled as such. Time axis is IST wall-clock.</p></div></div>
 
     <div class="panel">
       <div class="row">
         <div class="seg"><button :class="{ on: tf === 'daily' }" @click="setTf('daily')">Daily</button><button :class="{ on: tf === '15min' }" @click="setTf('15min')">15-minute</button></div>
+        <div class="seg" title="Raw: exactly as stored. Adjusted: verified split/bonus events applied to the older candles."><button :class="{ on: basis === 'raw' }" @click="setBasis('raw')">Raw</button><button :class="{ on: basis === 'adjusted' }" @click="setBasis('adjusted')">Adjusted</button></div>
+        <label v-if="basis === 'adjusted'" class="inline" title="Only events whose ex-date is on or before this day are applied: what a person standing on that day could know (no look-ahead, for backtests)">as known on <input type="date" v-model="asOf" /></label>
         <div class="ac" style="width:280px">
           <input type="search" v-model="q" placeholder="Symbol or company…" style="width:100%" @input="acOpen = true; search()" @focus="acOpen = true; search()" @blur="closeLater" />
           <ul v-if="acOpen && results.length"><li v-for="r in results" :key="r.security_id" @mousedown.prevent="choose(r)"><span><b>{{ r.symbol }}</b> <span class="muted">{{ r.name }}</span></span><span class="mono muted">{{ r.security_id }}</span></li></ul>
@@ -138,16 +163,25 @@ onMounted(async () => {
       <div class="grid" style="grid-template-columns:minmax(0,1fr) 270px">
         <div>
           <div class="chart-wrap">
-            <div class="legend" v-if="shown"><span style="color:#fff"><b>{{ data.symbol }}</b> · {{ tf === 'daily' ? '1D' : '15m' }} · IST</span> <span class="muted">{{ when(shown.t) }}</span></div>
-            <CandleChart ref="chart" :data="data" @hover="hover = $event" />
+            <div class="legend" v-if="shown"><span style="color:#fff"><b>{{ data.symbol }}</b> · {{ tf === 'daily' ? '1D' : '15m' }} · IST</span> <span class="badge" :class="isAdjusted ? 'b-adjusted' : 'b-raw'">{{ isAdjusted ? (noEvents ? 'ADJUSTED (no events: = raw)' : 'ADJUSTED') : 'RAW' }}</span> <span class="muted">{{ when(shown.t) }}</span></div>
+            <CandleChart ref="chart" :data="data" :gaps="gaps" @hover="hover = $event" />
             <div v-if="!data.n" class="empty" style="position:absolute;inset:0;background:#0a0f15cc;display:flex;flex-direction:column;justify-content:center"><b>No candles in this range</b>Nothing is invented for dates that were not downloaded.</div>
           </div>
-          <div class="muted small" style="margin-top:4px">{{ num(data.n) }} bars shown{{ data.truncated ? ' (truncated at the display limit; narrow the range)' : '' }}. Scroll to zoom, drag to pan, orange dots mark candles flagged on ingest.</div>
+          <Banner v-if="isAdjusted && data.adjustment" :kind="noEvents ? 'info' : 'warn'"><b>{{ data.adjustment.label }}</b>
+            <div class="small" v-if="data.adjustment.events_applied.length">Applied: <span v-for="(e, i) in data.adjustment.events_applied" :key="i" class="mono">{{ e.ex_date }} ×{{ Number(e.price_factor.toPrecision(6)) }}{{ i < data.adjustment.events_applied.length - 1 ? ' · ' : '' }}</span> — adjustment version {{ data.adjustment.version }}. Prices and volume before each ex-date are rescaled; candles on or after it are untouched. Exports of this view say so in every row.</div></Banner>
+          <div class="muted small" style="margin-top:4px">{{ num(data.n) }} bars shown{{ data.truncated ? ' (truncated at the display limit; narrow the range)' : '' }}. Scroll to zoom, drag to pan, orange dots mark candles flagged on ingest, arrows mark corporate-action ex-dates (purple = used in the adjusted series), grey squares mark gaps in the stored bars.</div>
         </div>
         <div>
           <div class="panel" v-if="shown"><h2>Selected candle</h2>
             <div class="kv mono"><span>Time</span><span>{{ when(shown.t) }}</span><span>Open</span><span>{{ price(shown.o) }}</span><span>High</span><span>{{ price(shown.h) }}</span><span>Low</span><span>{{ price(shown.l) }}</span>
               <span>Close</span><span :class="shown.c >= shown.o ? 'up' : 'down'">{{ price(shown.c) }}</span><span>Volume</span><span>{{ num(shown.v) }}</span><span>vs prev close</span><span :class="(chg ?? 0) >= 0 ? 'up' : 'down'">{{ chg === null ? '-' : (chg >= 0 ? '+' : '') + chg.toFixed(2) + '%' }}</span></div></div>
+          <div class="panel small" v-if="data.corporate_actions?.length"><h2>Corporate actions</h2>
+            <div v-for="e in data.corporate_actions" :key="e.action_id" style="margin-bottom:3px"><span class="mono">{{ e.ex_date.slice(0, 10) }}</span> {{ e.type }} {{ e.ratio ?? '' }} <span class="badge" :class="'b-' + e.status">{{ e.status.replace(/_/g, ' ') }}</span>
+              <span v-if="e.adjusts" class="muted"> ×{{ e.factor }}</span></div>
+            <div class="muted" style="margin-top:4px">Only verified events change the adjusted view. <RouterLink to="/corporate">Open the ledger</RouterLink></div></div>
+          <div class="panel small" v-if="gapRows.length"><h2>Gaps in the stored bars</h2>
+            <div v-for="(g, i) in gapRows" :key="i" class="mono">{{ g.from }} → {{ g.to }}</div>
+            <div class="muted" style="margin-top:4px">{{ gaps.length }} in view. A gap is a lead, not necessarily an error (holidays, a halt); it is never filled in. <RouterLink to="/quality">Missing sessions</RouterLink> lists the real holes.</div></div>
           <div class="panel"><h2>Coverage</h2>
             <div class="kv small"><span>Bars stored</span><span class="mono">{{ num(data.coverage.bars_total) }}</span><span>First candle</span><span class="mono">{{ data.coverage.first_candle ?? '-' }}</span><span>Last candle</span><span class="mono">{{ data.coverage.last_candle ?? '-' }}</span>
               <span>Windows covered</span><span class="mono">{{ day(data.coverage.covered_from) }} → {{ day(data.coverage.covered_to) }}</span><span>Complete / empty</span><span class="mono">{{ data.coverage.windows_complete }} / {{ data.coverage.windows_empty }}</span></div>
@@ -167,11 +201,13 @@ onMounted(async () => {
       </div>
 
       <div class="panel tight" style="margin-top:14px">
-        <div class="row" style="padding:10px 12px"><h2 style="margin:0">Raw candles</h2><span class="muted">{{ table ? num(table.total) : '-' }} rows in range</span><span class="grow"></span>
+        <div class="row" style="padding:10px 12px"><h2 style="margin:0">{{ isAdjusted ? 'Adjusted candles' : 'Raw candles' }}</h2><span class="badge" :class="isAdjusted ? 'b-adjusted' : 'b-raw'">{{ isAdjusted ? 'adjusted' : 'raw' }}</span><span class="muted">{{ table ? num(table.total) : '-' }} rows in range</span><span class="grow"></span>
           <select v-model.number="pageSize" @change="page = 1; loadTable()"><option :value="25">25 / page</option><option :value="50">50 / page</option><option :value="100">100 / page</option><option :value="500">500 / page</option></select></div>
         <DataTable :columns="cols" :rows="table?.rows ?? []" row-key="time" server-sort sort-key="time" :sort-desc="true" empty="No candles in this range." @sort="onSort">
           <template #cell-open="{ value }">{{ price(value) }}</template><template #cell-high="{ value }">{{ price(value) }}</template><template #cell-low="{ value }">{{ price(value) }}</template><template #cell-close="{ value }">{{ price(value) }}</template>
           <template #cell-volume="{ value }">{{ num(value) }}</template><template #cell-flags="{ value }"><span v-if="value" class="badge b-warning">{{ value }}</span></template>
+          <template #cell-provider="{ value }"><span class="badge" :class="value === 'dhan' ? 'b-info' : 'b-default'">{{ value }}</span></template>
+          <template #cell-revisions="{ value }"><span v-if="value" class="warn" title="A later fetch gave different values; the stored candle was kept and the difference recorded">{{ value }}</span><span v-else class="muted">0</span></template>
         </DataTable>
         <div class="pager"><button class="small" :disabled="page <= 1" @click="page--">‹ Prev</button><span>Page {{ page }} of {{ table ? Math.max(1, Math.ceil(table.total / pageSize)) : 1 }}</span>
           <button class="small" :disabled="!table || page >= Math.ceil(table.total / pageSize)" @click="page++">Next ›</button></div>

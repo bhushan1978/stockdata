@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3                                            # 3: provider/lane/yield columns, provider checks, automation runs
 
 ACTIVE = ("preparing", "running", "stopping")                      # a worker process may exist
 WAITING = ("queued",)
@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     instruments_total INTEGER, instruments_done INTEGER NOT NULL DEFAULT 0,
     rows_inserted INTEGER NOT NULL DEFAULT 0, attempts_used INTEGER NOT NULL DEFAULT 0,
     failed_windows INTEGER NOT NULL DEFAULT 0, retriable_windows INTEGER NOT NULL DEFAULT 0,
-    progress TEXT, fingerprint TEXT, source_job_id INTEGER, not_before TEXT);
+    progress TEXT, fingerprint TEXT, source_job_id INTEGER, not_before TEXT,
+    provider TEXT, lane TEXT, yielded_to INTEGER);
 CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status);
 CREATE TABLE IF NOT EXISTS job_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER NOT NULL REFERENCES jobs(id), seq INTEGER NOT NULL,
@@ -52,6 +53,13 @@ CREATE TABLE IF NOT EXISTS symbol_groups (
     id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, security_ids TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS cache (
     key TEXT PRIMARY KEY, value TEXT NOT NULL, fingerprint TEXT, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS provider_checks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT NOT NULL, kind TEXT NOT NULL, ts TEXT NOT NULL,
+    ok INTEGER NOT NULL, state TEXT, message TEXT, details TEXT);
+CREATE INDEX IF NOT EXISTS provider_checks_p ON provider_checks(provider, kind, id);
+CREATE TABLE IF NOT EXISTS automation_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, trigger TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT,
+    status TEXT NOT NULL, exit_code INTEGER, summary TEXT, jobs TEXT, pid INTEGER);
 """
 
 
@@ -77,6 +85,9 @@ class Store:
         cols = {r["name"] for r in self.all("PRAGMA table_info(jobs)")}
         if "not_before" not in cols:                              # v1 -> v2: scheduled start
             self.execute("ALTER TABLE jobs ADD COLUMN not_before TEXT")
+        for col, ddl in (("provider", "TEXT"), ("lane", "TEXT"), ("yielded_to", "INTEGER")):    # v2 -> v3: workflows and providers
+            if col not in cols:
+                self.execute(f"ALTER TABLE jobs ADD COLUMN {col} {ddl}")
         self.set_meta("schema_version", SCHEMA_VERSION)
 
     def close(self) -> None:

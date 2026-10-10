@@ -27,9 +27,10 @@ downloader**: every download is the normal `python -m stockdata download ...` co
    background, opens `http://127.0.0.1:8765/` and prints where it is running. If that port is taken it uses the next free one.
    Running it again while the application is already up just opens the running one (no duplicate). A failure prints what went
    wrong and waits for a key instead of closing.
-3. Everything else is done in the browser: credentials (**Settings → General**), instrument master (**Instruments**), downloads
-   (**Download Center**, **Job Queue**), data (**Data Explorer**, **Data Quality**) and health, backups, logs and shutdown
-   guidance (**Settings & Health**).
+3. Everything else is done in the browser: provider credentials and routing (**Providers**; Dhan's can also be entered in
+   **Settings → General**), instrument master (**Instruments**), backfills (**Historical Download**), daily upkeep (**Live
+   Updates**, **Automation**), the queue (**Job Queue**), data (**Data Explorer**, **Data Quality**, **Corporate Actions**) and
+   health, backups, logs and shutdown guidance (**Settings & Health**).
 4. When you are finished, double-click **`stop_stockdata.bat`**. If downloads are running it asks whether to *pause them first
    and then stop* (each download stops at a checkpoint boundary), *stop the application and leave them running*, or *cancel*.
    Nothing is ever killed silently. A later start recovers and can resume unfinished work.
@@ -48,7 +49,7 @@ it refuses any other `--host`.
 ## Starting the final historical download from the interface
 
 1. **Instruments** → *Refresh instrument master* (once; also shows when it was last loaded).
-2. **Download Center** → choose **Daily candles**, *Entire universe*, leave the history on its default → **Preview Plan**.
+2. **Historical Download** → choose **Daily candles**, *Entire universe*, leave the history on its default → **Preview Plan**.
    Check the plan (2,351 requests expected for daily; resolved start 1990-01-01, exclusive end, budget, disk, warnings).
 3. **Add to Queue** (or **Start Now**) → tick the confirmation. Repeat for **15-minute candles** (≈49,371 requests), or use
    *Create full-history campaign…* to queue both so the 15-minute job starts only after the daily job completes.
@@ -60,6 +61,17 @@ it refuses any other `--host`.
 
 Run daily and 15-minute one after the other (the default). *Settings → allow parallel* lets both run at once with each limited to
 2 requests/second, below Dhan's documented 5/s.
+
+## Providers, the two workflows and automation
+
+Dhan, FYERS and Upstox all write into the same two databases. **Providers** shows what each has actually been verified to
+provide (a capability probe measures range and history depth), keeps credentials (never displayed again, never logged), tests
+connections, sets per-provider request caps and chooses the default provider (and one per timeframe) — switching it resets nothing
+and replaces no candle. **Historical Download** (backfill/repair) and **Live Updates** (incremental from the last candle,
+post-close or polling) are separate workflows with their own queue entries and checkpoints; a live update pauses a historical job at
+its next checkpoint, runs, and the historical job resumes by itself. **Automation** installs/inspects/enables/disables/removes the
+two Windows scheduled tasks and shows next/last run, last result, missed days and recovery hints. Everything, including exact setup
+steps, exit codes and limitations, is in [PROVIDERS_AND_AUTOMATION.md](PROVIDERS_AND_AUTOMATION.md).
 
 ## What each control means (they are different on purpose)
 
@@ -133,8 +145,9 @@ worker. A program outside this application holding a database file is reported a
 
 Interactive documentation of every request/response model: **`/api/docs`** (while the server runs). Groups: `system` (health, overview,
 usage, shutdown), `jobs` (plan preview, create, start/pause/stop/resume/cancel/abandon/kill/retry_failed, reorder, events, runs),
-`campaigns`, `data` (catalog, instruments, candles, raw table, CSV export, groups), `quality`, `settings` (limits, credentials,
-data directory), `logs` (job logs, activity, server log, audit).
+`campaigns`, `data` (catalog, instruments, candles incl. `basis=raw|adjusted&as_of=`, raw table, CSV export, groups), `quality`
+(incl. coverage & reconciliation and `/api/lifecycle/{timeframe}`), `live` (`/api/live`), `providers`, `corporate-actions`,
+`automation`, `settings` (limits, credentials, data directory), `logs` (job logs, activity, server log, audit).
 
 ## Development
 
@@ -147,5 +160,6 @@ Backend tests: `pip install -r requirements-dev.txt && pytest -q` — they use t
 * Pause is graceful, never instantaneous; Force stop is a hard kill.
 * Next-day auto-resume works only while the server is running.
 * No ETA is shown until a run has completed 20 windows over a minute; it is labelled an estimate.
-* Historical *refresh* (`stockdata refresh`) and corporate-action tooling remain command-line only.
+* The Windows Task Scheduler backend and the FYERS/Upstox adapters have not been exercised against the real systems; see
+  [PROVIDERS_AND_AUTOMATION.md](PROVIDERS_AND_AUTOMATION.md) for the full list.
 * Disk-size and duration estimates are conservative planning figures, not measurements of the real universe.

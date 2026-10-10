@@ -79,11 +79,11 @@ async function planFor(tf, { symbols, start, end, schedule } = {}) {
   page.on('response', (r) => { if (r.status() >= 500) problems.push('http ' + r.status() + ' ' + r.url()) })
 
   // ------------------------------------------------------------------ navigation and global controls
-  await step('navigation: grouped menu with a prominent New download button', async () => {
+  await step('navigation: grouped menu with a prominent Historical download button', async () => {
     await goto('/', 'text=Request budget')
-    for (const t of ['Downloads', 'Data', 'System']) check(await page.locator('.navtitle', { hasText: t }).count(), 'missing nav group ' + t)
-    await page.click('.side button:has-text("New download")'); await page.waitForURL(/#\/download/)
-    check(await page.locator('.nav a', { hasText: 'Job Queue' }).count() && await page.locator('.nav a', { hasText: 'Download Center' }).count(), 'download links missing')
+    for (const t of ['Historical data', 'Live & current data', 'Data', 'System']) check(await page.locator('.navtitle', { hasText: t }).count(), 'missing nav group ' + t)
+    await page.click('.side button:has-text("Historical download")'); await page.waitForURL(/#\/download/)
+    check(await page.locator('.nav a', { hasText: 'Job Queue' }).count() && await page.locator('.nav a', { hasText: 'Historical Download' }).count() && await page.locator('.nav a', { hasText: 'Live Updates' }).count(), 'workflow links missing')
   })
   await step('top bar: queue switch asks before switching off, then on', async () => {
     await page.locator('.top .seg button:has-text("Off")').click()
@@ -277,7 +277,8 @@ async function planFor(tf, { symbols, start, end, schedule } = {}) {
 
   // ------------------------------------------------------------------ shutdown and recovery
   await step('Settings → Stopping: pause-first shutdown, then a later restart finds the job paused and resumes it', async () => {
-    await planFor('15min', { symbols: ['SIMA'], start: '2021-10-10', end: '2024-06-03' })
+    // an earlier step already stored SIMALPHA from 2022-01-01, so ask for older history: enough windows remain to pause in the middle
+    await planFor('15min', { symbols: ['SIMA'], start: '2019-01-01', end: '2024-06-03' })
     await page.click('button:has-text("Start Now")'); await confirm('Start download'); await page.waitForURL(/#\/queue/)
     const j = await until(async () => { const x = (await jobs()).find((q) => q.name === '15-minute - 1 instrument' && q.status === 'running' && q.progress.windows_done >= 1); return x }, 30000, 'running job')
     await goto('/settings?tab=stopping', 'text=Three different ways to stop')

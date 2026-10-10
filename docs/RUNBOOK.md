@@ -138,3 +138,33 @@ stocks from 3 August 2026; see [DATA_QUALITY.md](DATA_QUALITY.md)). Missing cand
 
 Later updates use the same commands (only the new range plus a 7-day overlap is requested). To replace a range with Dhan's
 current data after a corporate action, use `python -m stockdata refresh ...` (see the README).
+
+## 8. Daily upkeep and provider recovery (after the backfill)
+
+Daily upkeep is a different workflow from the backfill: it never fetches history and never needs a date range
+(details and Windows setup: [PROVIDERS_AND_AUTOMATION.md](PROVIDERS_AND_AUTOMATION.md)).
+
+1. **Providers** → confirm the default provider and that its credential shows *Credentials present* (then *Test connection*).
+2. **Live Updates** → *Update now…* once by hand: read the plan (instruments to update, requests, budget) and confirm.
+3. **Automation** → set the time (default 18:15 IST) and days → *Save* → *Install / update tasks* → *Run daily update now* once.
+4. Each day, glance at **Automation → Recent runs** (or `python -m stockdata.web automation status`).
+
+| Run result / exit code | Meaning | What to do |
+|---|---|---|
+| `0` completed | all instruments updated | nothing |
+| `2` completed with warnings | some instruments failed | **Live Updates → Failed instruments → Retry failed** |
+| `3` ACTION REQUIRED | a credential was rejected or has expired | Providers → paste the new token → *Test connection* → *Run daily update now* |
+| `4` request budget | the provider's daily cap was reached | nothing is lost; the next run continues from the last stored candle |
+| `6` disk space | too little free space | free space on the data drive, then *Run daily update now* |
+| `7` integrity check failed | a critical check failed after an update | Data Quality → the named timeframe → review; use *Fill gaps* for missing sessions |
+| `8` application not responding | the run could not hand over to a running, unresponsive application | `stop_stockdata.bat`, then run again |
+| `75` another run in progress | a second instance was started | nothing: the first one continues |
+
+* **Missed days.** If the PC was off, the task runs when it is next available and an update continues from each instrument's last
+  stored candle, so missed days are caught up by themselves. Automation lists days with no recorded run.
+* **Holes inside the history.** *Data Quality → Coverage & reconciliation → Missing sessions* → select → *Fill gaps for selected…*
+  (adds only absent candles; nothing stored is replaced). The CLI form is `refresh --fill-only`.
+* **Two providers disagree on a candle.** The stored candle is kept and the difference is listed under *Provider disagreements*;
+  replacing it is a separate, explicit repair (`refresh --allow-cross-provider`) — decide which provider you trust for that range.
+* **Never** delete `request_ledger.sqlite`, `*.duckdb.wal`, or `data\web\app_control.sqlite` to "fix" a scheduled run; the
+  checkpoints that make a rerun safe live in the candle databases.

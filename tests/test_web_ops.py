@@ -35,6 +35,19 @@ def test_a_scheduled_job_waits_for_its_time_and_start_now_overrides_the_schedule
     drive(env, status_is(env, past["id"], "completed"))                                                  # a time in the past is simply "now"
 
 
+def test_start_now_on_a_job_the_scheduler_already_started_is_not_an_error(web_env, fake, monkeypatch):
+    """Creating a job wakes the scheduler, which can start it before the explicit 'start now' arrives (seen as an
+    intermittent HTTP 409 'job is already running' under load). That is the outcome that was asked for."""
+    point_workers_at(monkeypatch, fake)
+    env = web_env
+    job = env.create(daily_spec(("SIMALPHA",)))["job"]
+    env.sup.tick()                                                     # the scheduler wins the race
+    assert env.job(job["id"])["status"] in ("preparing", "running", "completed")
+    again = env.act(job["id"], "start")                                # used to answer 409
+    assert again["waiting_reason"] is None
+    drive(env, status_is(env, job["id"], "completed"))
+
+
 def test_a_campaign_can_be_scheduled_paused_resumed_cancelled_and_removed(web_env, fake, monkeypatch):
     point_workers_at(monkeypatch, fake)
     env = web_env
@@ -239,7 +252,8 @@ def test_an_older_control_database_is_upgraded_in_place(tmp_path):
     con.commit(); con.close()
     store = Store(path)
     row = store.one("SELECT name, status, not_before FROM jobs")
-    assert row == {"name": "kept", "status": "paused", "not_before": None} and store.get_meta("schema_version") == 2
+    assert row == {"name": "kept", "status": "paused", "not_before": None} and store.get_meta("schema_version") == 3
+    assert store.one("SELECT provider, lane, yielded_to FROM jobs") == {"provider": None, "lane": None, "yielded_to": None}   # legacy = Dhan
     store.close()
 
 

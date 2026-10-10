@@ -8,11 +8,18 @@ import InstrumentPicker, { type Picked } from '../components/InstrumentPicker.vu
 import ProgressBar from '../components/ProgressBar.vue'
 import { bytes, duration, istLabel, num } from '../format'
 import { errText, toast } from '../state'
-import type { Plan, Timeframe } from '../types'
+import type { Plan, Provider, Timeframe } from '../types'
 
 const route = useRoute()
 const router = useRouter()
 const timeframe = ref<Timeframe>('daily')
+// provider and kind of historical work: 'download' (missing data only, the default), or an explicit repair of data already stored
+const providers = ref<any[]>([])
+const provider = ref<Provider | ''>('')
+const defaults = ref<{ default: string; by_timeframe: Record<string, string> }>({ default: 'dhan', by_timeframe: {} })
+const workMode = ref<'download' | 'fill_gaps' | 'replace'>('download')
+const allowCross = ref(false)
+const fillProviderGaps = ref(false)
 const mode = ref<'all' | 'picked' | 'group'>('all')
 const picked = ref<Picked[]>([])
 const groups = ref<any[]>([])
@@ -41,20 +48,30 @@ const draftUnknown = computed(() => draft.value.filter((d) => d.requests === nul
 watch(draft, (d) => { try { sessionStorage.setItem('campaignDraft', JSON.stringify(d)) } catch { /* private mode */ } }, { deep: true })
 
 const count = computed(() => mode.value === 'all' ? null : mode.value === 'picked' ? picked.value.length : (groups.value.find((g) => g.id === groupId.value)?.count ?? 0))
-const valid = computed(() => mode.value === 'all' || (count.value ?? 0) > 0)
+const valid = computed(() => (mode.value === 'all' || (count.value ?? 0) > 0) && !repairBlock.value)
 // While a download is writing this timeframe's database the plan cannot be computed. Queueing is still allowed (the worker computes
 // the real plan when it starts, within the same limits); starting immediately is not, because the queue would hold it anyway.
 const unpreviewed = computed(() => !plan.value && !!planErr.value?.busy)
 const queueable = computed(() => (!!plan.value && !plan.value.blockers.length) || unpreviewed.value)
 
+const effectiveProvider = computed<string>(() => provider.value || defaults.value.by_timeframe?.[timeframe.value] || defaults.value.default)
+const providerInfo = computed(() => providers.value.find((p) => p.provider === effectiveProvider.value) ?? null)
+const providerLabel = computed(() => providerInfo.value?.label ?? effectiveProvider.value)
+const tfCaps = computed(() => providerInfo.value?.capabilities.timeframes[timeframe.value] ?? null)
+const isRepair = computed(() => workMode.value !== 'download')
+// a repair names its instruments and a start date; it never covers the whole universe
+const repairBlock = computed(() => !isRepair.value ? '' : mode.value === 'all' ? 'A repair names its instruments: choose “Select symbols” or a saved group.' : !start.value ? 'A repair needs an explicit start date.' : '')
 function spec(confirmFull: boolean) {
   const selection: any = mode.value === 'all' ? { mode: 'all' } : mode.value === 'group' ? { mode: 'group', group_id: groupId.value }
     : { mode: 'security_ids', security_ids: picked.value.map((p) => p.security_id) }
   if (limit.value) selection.limit = limit.value
-  return { kind: 'download', timeframe: timeframe.value, selection, start_date: customRange.value && start.value ? start.value : null,
-    end_date: customRange.value && end.value ? end.value : null, retry_failed: retryFailed.value, confirm_full: confirmFull }
+  const base: any = { timeframe: timeframe.value, provider: provider.value || null, selection, start_date: (customRange.value || isRepair.value) && start.value ? start.value : null,
+    end_date: (customRange.value || isRepair.value) && end.value ? end.value : null }
+  if (isRepair.value) return { ...base, kind: 'refresh', refresh_mode: workMode.value, allow_cross_provider: workMode.value === 'replace' && allowCross.value }
+  return { ...base, kind: 'download', retry_failed: retryFailed.value, confirm_full: confirmFull, fill_provider_gaps: fillProviderGaps.value }
 }
-watch([timeframe, mode, picked, groupId, customRange, start, end, limit, retryFailed, scheduleOn, scheduleAt], () => { plan.value = null; planErr.value = null }, { deep: true })
+watch([timeframe, mode, picked, groupId, customRange, start, end, limit, retryFailed, scheduleOn, scheduleAt, provider, workMode, allowCross, fillProviderGaps], () => { plan.value = null; planErr.value = null }, { deep: true })
+watch(workMode, (m) => { if (m !== 'download') customRange.value = true })
 
 async function preview() {
   loading.value = true; plan.value = null; planErr.value = null
@@ -111,8 +128,11 @@ async function createCampaign() {
 }
 function reset() { plan.value = null; planErr.value = null; picked.value = []; mode.value = 'all'; customRange.value = false; limit.value = null; retryFailed.value = false }
 
+async function loadProviders() {
+  try { const r = await api.get('/providers'); providers.value = r.providers; defaults.value = { default: r.default, by_timeframe: r.by_timeframe ?? {} } } catch { /* the Providers screen reports it */ }
+}
 onMounted(async () => {
-  await loadGroups()
+  await Promise.all([loadGroups(), loadProviders()])
   if (route.query.tf === 'daily' || route.query.tf === '15min') timeframe.value = route.query.tf
   const ids = String(route.query.ids ?? '').split(',').map((s) => parseInt(s)).filter(Boolean).slice(0, 300)
   if (ids.length) {
@@ -122,15 +142,16 @@ onMounted(async () => {
     picked.value = out
   }
 })
-const rangeText = computed(() => timeframe.value === 'daily'
-  ? 'Complete available history: from 1990-01-01 (the engine asks once per instrument; Dhan returns data from its own data start, e.g. 2002 for RELIANCE).'
-  : 'Five years of 15-minute history, in windows of at most 89 days (the API refuses more than 90). The first real run pins the start date for later runs.')
+const rangeText = computed(() => isRepair.value ? 'A repair covers the dates you give: windows already stored are re-requested, validated in full, and only then applied atomically.'
+  : timeframe.value === 'daily'
+  ? 'Complete available history: from 1990-01-01 (the engine asks once per instrument; the provider returns data from its own data start, e.g. 2002 for RELIANCE on Dhan).'
+  : 'About five years of 15-minute history, in windows no larger than the provider accepts (Dhan: 89 days). The first real run pins the start date for later runs.')
 </script>
 
 <template>
   <div>
-    <div class="page-head"><div><h1>Download Center</h1>
-      <p>Choose what to download, preview the exact request plan from the real planner, then queue it or start it. Previewing never sends a request.</p></div>
+    <div class="page-head"><div><h1>Historical Data Download</h1>
+      <p>Backfill history for a chosen provider, timeframe and date range, in resumable windows with its own checkpoints. Previewing never sends a request. Daily upkeep after the close is a separate workflow: <RouterLink to="/live">Live &amp; Current Updates</RouterLink>.</p></div>
       <div class="btnrow"><button @click="presetFullHistory" title="Fills the campaign draft below with the whole universe, daily then 15-minute">Full-history campaign preset</button></div></div>
 
     <div class="grid g2">
@@ -141,9 +162,35 @@ const rangeText = computed(() => timeframe.value === 'daily'
             <div class="choice" :class="{ on: timeframe === '15min' }" @click="timeframe = '15min'"><b>15-minute candles</b><span class="muted small">stockdata_15min.duckdb · /charts/intraday</span></div>
           </div></div>
 
-        <div class="panel"><h2>2 · Instruments <span class="mono" style="margin-left:6px;color:var(--text)">{{ mode === 'all' ? 'entire loaded universe' : (count ?? 0) + ' selected' }}</span></h2>
+        <div class="panel"><h2>2 · Provider</h2>
+          <div class="row">
+            <select v-model="provider" style="min-width:240px"><option value="">Default for this timeframe ({{ providers.find((p) => p.provider === (defaults.by_timeframe?.[timeframe] || defaults.default))?.label ?? defaults.default }})</option>
+              <option v-for="p in providers" :key="p.provider" :value="p.provider" :disabled="!p.capabilities.timeframes[timeframe]?.supported">{{ p.label }}{{ p.capabilities.timeframes[timeframe]?.supported ? '' : ' (not supported)' }}</option></select>
+            <RouterLink to="/providers" class="small">manage providers</RouterLink>
+          </div>
+          <div v-if="providerInfo && tfCaps" class="muted small" style="margin-top:8px">
+            {{ providerLabel }} · {{ timeframe === 'daily' ? 'daily' : '15-minute' }}: at most {{ tfCaps.max_window_days ? num(tfCaps.max_window_days) + ' days' : 'the whole history' }} per request · history from {{ tfCaps.verified.has_data_since ?? tfCaps.earliest_date ?? 'a date that is not known yet' }}
+            <span class="badge" :class="'b-' + tfCaps.status">{{ tfCaps.status === 'probe_verified' || tfCaps.status === 'sdk_confirmed' ? 'verified' : tfCaps.status === 'unknown' ? 'unknown' : 'documented, unverified' }}</span>
+            · credentials <span class="badge" :class="'b-' + providerInfo.auth.state">{{ providerInfo.auth.state.replace('_', ' ') }}</span>
+          </div>
+          <div class="hint" style="margin-top:6px">The provider is fixed when the job is created. Where another provider already stored candles for a range, they are kept and any difference is recorded — never silently mixed or overwritten.</div>
+        </div>
+
+        <div class="panel"><h2>3 · What to do</h2>
+          <div class="grid g3">
+            <div class="choice" :class="{ on: workMode === 'download' }" @click="workMode = 'download'"><b>Download missing data</b><span class="muted small">default · only ranges not yet stored; never overwrites</span></div>
+            <div class="choice" :class="{ on: workMode === 'fill_gaps' }" @click="workMode = 'fill_gaps'"><b>Fill gaps</b><span class="muted small">repair · re-request stored ranges, add candles that are missing, keep every stored value</span></div>
+            <div class="choice" :class="{ on: workMode === 'replace' }" @click="workMode = 'replace'"><b>Replace data</b><span class="muted small">repair · explicit, validated, atomic and audited; stored values are archived</span></div>
+          </div>
+          <Banner v-if="workMode === 'fill_gaps'" kind="info" style="margin-top:10px">Adds only candles that are absent. A candle that already exists is never changed; if the source differs it is recorded as a disagreement for review.</Banner>
+          <Banner v-if="workMode === 'replace'" kind="warn" style="margin-top:10px">Replaces stored candles that differ from what the provider serves now. Each window is fully validated before anything changes, the whole swap is atomic, and the old values are kept in the revision history. Use it for a known correction, not routinely.
+            <label class="inline" style="margin-top:6px"><input type="checkbox" v-model="allowCross" /> allow replacing candles that were stored from <i>another</i> provider</label></Banner>
+          <Banner v-if="repairBlock" kind="info" style="margin-top:10px">{{ repairBlock }}</Banner>
+        </div>
+
+        <div class="panel"><h2>4 · Instruments <span class="mono" style="margin-left:6px;color:var(--text)">{{ mode === 'all' ? 'entire loaded universe' : (count ?? 0) + ' selected' }}</span></h2>
           <div class="seg" style="margin-bottom:10px"><button :class="{ on: mode === 'all' }" @click="mode = 'all'">Entire universe</button><button :class="{ on: mode === 'picked' }" @click="mode = 'picked'">Select symbols</button><button :class="{ on: mode === 'group' }" @click="mode = 'group'">Saved group</button></div>
-          <div v-if="mode === 'all'" class="muted">Every active instrument in the loaded master (normally the 2,351 NSE equity shares). Whole-universe jobs need an explicit confirmation before they are created.</div>
+          <div v-if="mode === 'all'" class="muted">Every active instrument in the loaded master (normally the 2,351 NSE equity shares). Whole-universe jobs need an explicit confirmation before they are created.<span v-if="isRepair"> A repair cannot cover the whole universe.</span></div>
           <div v-else-if="mode === 'picked'">
             <InstrumentPicker v-model="picked" />
             <div class="row" style="margin-top:8px" v-if="picked.length"><input type="text" v-model="groupName" placeholder="Group name" style="width:180px" /><button class="small" :disabled="!groupName.trim()" @click="saveGroup">Save as group</button></div>
@@ -154,20 +201,21 @@ const rangeText = computed(() => timeframe.value === 'daily'
           </div>
         </div>
 
-        <div class="panel"><h2>3 · History</h2>
+        <div class="panel"><h2>5 · {{ isRepair ? 'Date range' : 'History' }}</h2>
           <div class="muted" style="margin-bottom:8px">{{ rangeText }}</div>
-          <label class="inline"><input type="checkbox" v-model="customRange" /> Use an explicit date range</label>
-          <div v-if="customRange" class="row" style="margin-top:8px">
+          <label class="inline" v-if="!isRepair"><input type="checkbox" v-model="customRange" /> Use an explicit date range</label>
+          <div v-if="customRange || isRepair" class="row" style="margin-top:8px">
             <label class="field"><span>Start date (inclusive)</span><input type="date" v-model="start" /></label>
             <label class="field"><span>End date (exclusive; empty = latest final day)</span><input type="date" v-model="end" /></label>
           </div>
           <details style="margin-top:10px"><summary>Advanced</summary>
-            <div class="row" style="margin-top:6px"><label class="inline"><input type="checkbox" v-model="retryFailed" /> Also retry previously failed windows</label>
+            <div class="row" style="margin-top:6px"><label class="inline" v-if="!isRepair"><input type="checkbox" v-model="retryFailed" /> Also retry previously failed windows</label>
+              <label class="inline" v-if="!isRepair" title="Normally a range another provider found empty is not asked again; this requests it from the chosen provider"><input type="checkbox" v-model="fillProviderGaps" /> Also request ranges another provider found empty</label>
               <label class="inline">Only the first <input type="number" min="1" v-model.number="limit" style="width:80px" placeholder="all" /> instruments (alphabetical)</label></div>
           </details>
         </div>
 
-        <div class="panel"><h2>4 · When</h2>
+        <div class="panel"><h2>6 · When</h2>
           <label class="inline"><input type="checkbox" v-model="scheduleOn" /> Schedule: do not start before a chosen time (applies to Add to Queue and to campaigns)</label>
           <div v-if="scheduleOn" class="row" style="margin-top:8px"><label class="field"><span>Start no earlier than (IST)</span><input type="datetime-local" v-model="scheduleAt" /></label>
             <span class="hint" style="max-width:360px">The queue starts it at that time or later, as long as the application is running then. “Start Now” ignores the schedule.</span></div>
@@ -185,9 +233,9 @@ const rangeText = computed(() => timeframe.value === 'daily'
 
       <div>
         <Banner v-if="planErr" :kind="planErr.busy ? 'warn' : 'error'">{{ planErr.msg }}<template v-if="planErr.busy"> You can still use <b>Add to Queue</b> without a preview: the exact plan is worked out when the job starts, within the same limits, and the job waits its turn. Or <RouterLink to="/queue">pause the active job</RouterLink> to preview first.</template></Banner>
-        <div v-if="!plan && !planErr" class="panel empty"><b>No plan yet</b>Press “Preview Plan” to run the project's own dry-run planner against the database. Nothing is sent to Dhan.</div>
+        <div v-if="!plan && !planErr" class="panel empty"><b>No plan yet</b>Press “Preview Plan” to run the project's own dry-run planner against the database. Nothing is sent to {{ providerLabel }}.</div>
         <div v-if="plan" class="panel">
-          <h2>Request plan <span class="badge b-info">from the real planner</span></h2>
+          <h2>Request plan <span class="badge b-info">from the real planner</span> <span class="badge b-default" v-if="(plan as any).provider_label">{{ (plan as any).provider_label }}</span></h2>
           <div class="kv">
             <span>Instruments</span><span class="mono">{{ num(plan.instruments) }} ({{ num(plan.instruments_with_work) }} with work to do)</span>
             <span>Request windows</span><span class="mono"><b>{{ num(plan.windows) }}</b> planned API attempts (before retries)</span>
@@ -220,8 +268,8 @@ const rangeText = computed(() => timeframe.value === 'daily'
       </div>
     </div>
 
-    <ConfirmDialog :open="confirmMode !== ''" :title="confirmMode === 'now' ? 'Start this download now?' : 'Add this download to the queue?'" :confirm-label="confirmMode === 'now' ? 'Start download' : 'Add to queue'"
-      :check="plan ? `I understand this will send up to ${num(plan.windows)} requests to Dhan${mode === 'all' ? ' for the entire universe' : ''}.` : `I understand the number of requests is not known until the job starts (it is held to my run and day limits)${mode === 'all' ? ' and that this is the entire universe' : ''}.`" :busy="working" @cancel="confirmMode = ''" @confirm="submit(confirmMode === 'now' ? 'now' : 'queue')">
+    <ConfirmDialog :open="confirmMode !== ''" :title="confirmMode === 'now' ? (isRepair ? 'Start this repair now?' : 'Start this download now?') : (isRepair ? 'Add this repair to the queue?' : 'Add this download to the queue?')" :confirm-label="confirmMode === 'now' ? 'Start download' : 'Add to queue'"
+      :check="plan ? `I understand this will send up to ${num(plan.windows)} requests to ${providerLabel}${mode === 'all' ? ' for the entire universe' : ''}.` : `I understand the number of requests is not known until the job starts (it is held to my run and day limits)${mode === 'all' ? ' and that this is the entire universe' : ''}.`" :busy="working" @cancel="confirmMode = ''" @confirm="submit(confirmMode === 'now' ? 'now' : 'queue')">
       <div v-if="plan" class="kv"><span v-if="confirmMode === 'queue' && scheduleOn && scheduleAt">Scheduled</span><span v-if="confirmMode === 'queue' && scheduleOn && scheduleAt" class="mono">not before {{ scheduleAt.replace('T', ' ') }} IST</span><span>Dataset</span><span>{{ timeframe === 'daily' ? 'Daily' : '15-minute' }}</span><span>Instruments</span><span>{{ num(plan.instruments) }}</span><span>Range</span><span class="mono">{{ plan.resolved_start }} → {{ plan.end_exclusive }} (exclusive)</span>
         <span>Requests</span><span class="mono">{{ num(plan.windows) }}</span><span>Writes to</span><span class="mono small">{{ plan.paths.database }}</span></div>
       <div v-else class="kv"><span>Dataset</span><span>{{ timeframe === 'daily' ? 'Daily' : '15-minute' }}</span><span>Instruments</span><span>{{ selectionText() }}</span><span>Requests</span><span>not previewed: another job is writing this database, so the plan is worked out when this job starts</span></div>
@@ -241,7 +289,7 @@ const rangeText = computed(() => timeframe.value === 'daily'
         <button class="primary" :disabled="!campName.trim()" @click="campaignOpen = true">Create campaign…</button><button class="ghost" @click="draft = []">Clear</button></div>
     </div>
 
-    <ConfirmDialog :open="campaignOpen" title="Create this campaign?" confirm-label="Create campaign" :check="`I understand these jobs will send about ${num(draftTotal)} requests to Dhan, one job after another.`" :busy="working" @cancel="campaignOpen = false" @confirm="createCampaign">
+    <ConfirmDialog :open="campaignOpen" title="Create this campaign?" confirm-label="Create campaign" :check="`I understand these jobs will send about ${num(draftTotal)} requests to the chosen provider(s), one job after another.`" :busy="working" @cancel="campaignOpen = false" @confirm="createCampaign">
       <ol class="small" style="margin:0 0 6px 18px;padding:0"><li v-for="d in draft" :key="d.label">{{ d.label }}</li></ol>
       Each job starts only after the previous one completed{{ campWarn ? ' (or finished with warnings)' : ' successfully' }}; any failure, authentication problem or request-limit stop holds the rest until you resume.
       <span v-if="scheduleOn && scheduleAt"> The first job will not start before {{ scheduleAt.replace('T', ' ') }} IST.</span> Nothing starts until the queue reaches the first job.

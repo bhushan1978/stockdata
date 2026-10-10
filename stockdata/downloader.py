@@ -16,11 +16,13 @@ from datetime import date, datetime, timedelta
 from stockdata import config
 from stockdata.budget import RequestLimitReached
 from stockdata.db import CandleDB
-from stockdata.dhan import (DhanAuthError, DhanClient, DhanPermanentError, DhanTransientError)
+from stockdata.providers import get_provider
+from stockdata.providers.base import ProviderAdapter
+from stockdata.providers.errors import AuthError, PermanentError, TransientError
 from stockdata.instruments import Instrument
 from stockdata.timeframes import Timeframe
 from stockdata.timeutil import to_midnight
-from stockdata.validation import ValidationError, empty_result, validate_response
+from stockdata.validation import ValidationError, empty_result
 from stockdata.windows import Window, plan_windows
 
 log = logging.getLogger("stockdata.download")
@@ -56,6 +58,10 @@ class RunOptions:
     breaker: int = 5                      # consecutive retriable windows before aborting
     intraday_date_format: str = "datetime"
     client_id: str | None = None
+    provider: str | None = None           # the provider these windows are planned for (None = legacy: coverage of any provider)
+    foreign_empty_is_gap: bool = False    # an 'empty' window recorded by ANOTHER provider does not count as covered
+    planner: object = None                # optional (db, instrument, opts) -> windows: lets the update workflow plan its own
+                                          # incremental windows while everything else (budget, stop, commit) stays shared
 
 
 @dataclass
@@ -66,6 +72,7 @@ class InstrumentResult:
     rows_inserted: int = 0
     rows_revised: int = 0
     seconds: float = 0.0
+    last_failure: str | None = None
 
 
 def five_years_before(d: datetime) -> datetime:
@@ -118,7 +125,8 @@ def select_instruments(db: CandleDB, *, symbols: list[str] | None, security_ids:
 def plan_instrument_windows(db: CandleDB, inst: Instrument, opts: RunOptions) -> list[Window]:
     """The windows the downloader will walk for one instrument, newest first (the single source of truth for
     both the real run and every preview/dry-run)."""
-    covered = [] if opts.refetch else db.covered_intervals(inst)
+    covered = [] if opts.refetch else db.covered_intervals(inst, provider=opts.provider,
+                                                             foreign_empty_is_gap=opts.foreign_empty_is_gap)
     windows = plan_windows(covered, opts.history_start, opts.cutoff, opts.window_days, 0)
     # The overlap only belongs on a *fresh* forward gap. If one of the plain windows already
     # has a failed/retriable record, keep its exact key so the checkpoint is retried, not orphaned.
@@ -128,8 +136,9 @@ def plan_instrument_windows(db: CandleDB, inst: Instrument, opts: RunOptions) ->
 
 
 class Downloader:
-    def __init__(self, db: CandleDB, client: DhanClient, control=None):
+    def __init__(self, db: CandleDB, client, control=None, provider: ProviderAdapter | None = None):
         self.db, self.client, self.tf = db, client, db.tf
+        self.provider = provider or get_provider("dhan")     # the client belongs to this provider (Dhan unless told otherwise)
         self.control = control      # optional stockdata.jobcontrol.JobControl (stop requests + progress); None = off
         self._last_failure: str | None = None
         self._last_attempts = 1
@@ -183,7 +192,7 @@ class Downloader:
                              stats: Counter) -> InstrumentResult:
         t0 = time.monotonic()
         res = InstrumentResult(inst.symbol, inst.security_id)
-        windows = plan_instrument_windows(self.db, inst, opts)
+        windows = (opts.planner or plan_instrument_windows)(self.db, inst, opts)
         self._report("instrument_start", index=n, total=total, symbol=inst.symbol, security_id=inst.security_id)
         for w in windows:
             if self.db.window_status(inst, w) == "failed" and not opts.retry_failed:
@@ -196,6 +205,8 @@ class Downloader:
             rows_before, rev_before = res.rows_inserted, res.rows_revised
             outcome = self._download_window(inst, w, opts, stats, res)
             res.windows[outcome] += 1
+            if outcome in ("failed", "retriable"):
+                res.last_failure = self._last_failure
             stats["attempted"] += 1
             stats[outcome] += 1
             self._report("window_done", outcome=outcome, rows_inserted=res.rows_inserted - rows_before,
@@ -211,37 +222,37 @@ class Downloader:
 
     def _download_window(self, inst: Instrument, w: Window, opts: RunOptions, stats: Counter,
                          res: InstrumentResult) -> str:
-        payload = self.tf.payload(inst, w.start, w.end, intraday_date_format=opts.intraday_date_format,
-                                  client_id=opts.client_id)
+        prov = self.provider
         self._last_attempts = 1
         try:
-            resp = self.client.post(self.tf.endpoint, payload)
+            resp = prov.fetch(self.client, inst, self.tf, w, opts)
             self._last_attempts = resp.attempts
         except RequestLimitReached as exc:
             raise limit_abort(exc) from exc
-        except DhanAuthError as exc:
+        except AuthError as exc:
             raise RunAborted(f"authentication rejected ({exc.message}); refresh the access token "
-                             "and rerun the same command to resume") from exc
-        except DhanPermanentError as exc:
+                             f"and rerun the same command to resume ({prov.label})") from exc
+        except PermanentError as exc:
             self._last_attempts = exc.attempts
             self._consecutive_retriable = 0
             if exc.error_code and exc.error_code in opts.empty_error_codes:
                 empty = empty_result(self.tf)
                 self.db.commit_window(inst, w, candles=empty.candles, anomalies=empty.anomalies,
                                       zero_volume=0, attempts=exc.attempts, http_status=exc.http_status,
-                                      empty_error_code=exc.error_code, empty_error_message=exc.message[:500])
+                                      empty_error_code=exc.error_code, empty_error_message=exc.message[:500],
+                                      provider=prov.name)
                 return "empty"
             self.db.record_failure(inst, w, status="failed", attempts=exc.attempts,
                                    http_status=exc.http_status, error_code=exc.error_code,
-                                   error_message=exc.message)
+                                   error_message=exc.message, provider=prov.name)
             log.error("%s %s [%s, %s): FAILED %s", inst.symbol, self.tf.name, w.start, w.end, exc.message)
             self._last_failure = f"{inst.symbol}: {exc.error_code or exc.http_status}: {exc.message}"
             return "failed"
-        except DhanTransientError as exc:
+        except TransientError as exc:
             self._last_attempts = exc.attempts
             self.db.record_failure(inst, w, status="retriable", attempts=exc.attempts,
                                    http_status=exc.http_status, error_code=exc.error_code,
-                                   error_message=exc.message)
+                                   error_message=exc.message, provider=prov.name)
             log.error("%s %s [%s, %s): RETRIABLE after %d attempts: %s", inst.symbol, self.tf.name,
                       w.start, w.end, exc.attempts, exc.message)
             self._last_failure = f"{inst.symbol}: {exc.message}"
@@ -252,17 +263,18 @@ class Downloader:
             return "retriable"
         self._consecutive_retriable = 0
         try:
-            v = validate_response(self.tf, resp.data, w)
+            v = prov.to_canonical(self.tf, resp, w)
         except ValidationError as exc:
             self.db.record_failure(inst, w, status="failed", attempts=resp.attempts,
                                    http_status=resp.http_status, error_code=exc.code,
-                                   error_message=exc.message)
+                                   error_message=exc.message, provider=prov.name)
             log.error("%s %s [%s, %s): FAILED validation %s", inst.symbol, self.tf.name, w.start, w.end, exc)
             self._last_failure = f"{inst.symbol}: validation {exc.code}"
             return "failed"
         out = self.db.commit_window(inst, w, candles=v.candles, anomalies=v.anomalies,
                                     zero_volume=v.zero_volume_rows, attempts=resp.attempts,
-                                    http_status=resp.http_status)
+                                    http_status=resp.http_status, provider=prov.name,
+                                    empty_error_code=prov.empty_code(resp) if not v.n else None)
         res.rows_inserted += out["inserted"]
         res.rows_revised += out["revised"]
         stats["rows_inserted"] += out["inserted"]

@@ -12,15 +12,21 @@ import csv
 import io
 import threading
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterator
 
 import duckdb
+import numpy as np
+
+from stockdata import corp_actions as ca
 
 from stockdata.timeframes import TIMEFRAMES, get_timeframe
 from stockdata.web.store import Store
 
+BASES = ("raw", "adjusted")
+ADJUSTED_LABEL = "SPLIT/BONUS ADJUSTED (verified events only; prices and volume; no dividend adjustment)"
+RAW_LABEL = "RAW (exactly as stored from the provider)"
 TIMEZONE_NOTE = ("IST (Asia/Kolkata). Candle times are stored as naive IST wall-clock values; chart axes show "
                  "those wall-clock values unchanged.")
 MAX_BARS = 150_000
@@ -285,6 +291,31 @@ class DataAccess:
         names = [r for r in rows if q in (r["name"] or "").upper() and r not in starts and r not in contains]
         return (starts + contains + names)[:limit]
 
+    def ensure_schema(self, busy: Callable[[str], bool]) -> list[str]:
+        """Bring a database written by an older version up to date (additive columns only), when nothing is writing it.
+        Returns the databases that were migrated. Anything busy or locked is left alone: the worker that owns it migrates it
+        when it opens it for writing."""
+        done = []
+        for tf in TIMEFRAMES:
+            p = self.path(tf)
+            if not p.exists() or busy(tf):
+                continue
+            try:
+                from stockdata.db import CandleDB
+                con = duckdb.connect(str(p), read_only=True)
+                try:
+                    have = {r[0] for r in con.execute("SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+                                                      [get_timeframe(tf).table]).fetchall()}
+                finally:
+                    con.close()
+                if "provider" in have:
+                    continue
+                with CandleDB(get_timeframe(tf), p):
+                    done.append(tf)
+            except Exception:                                    # noqa: BLE001 - locked by another program: not our business here
+                continue
+        return done
+
     # -- candles ------------------------------------------------------------------------------------------------
     def _bounds(self, tf: str, start: date | None, end: date | None) -> tuple[str, list]:
         t = get_timeframe(tf)
@@ -297,8 +328,35 @@ class DataAccess:
             where.append(f"{key} < ?"); params.append(datetime.combine(nxt, datetime.min.time()) if t.is_intraday else nxt)
         return " AND ".join(where), params
 
+    @staticmethod
+    def _adjust_rows(rows: list, events: list[tuple[date, float, float]]) -> tuple[list, list[float]]:
+        """rows: (epoch, o, h, l, c, v) with the epoch of the naive IST wall-clock time. Returns the adjusted rows and the
+        cumulative price factor of each (a candle is multiplied by every event whose ex-date is after its own date)."""
+        if not rows or not events:
+            return rows, [1.0] * len(rows)
+        days = np.array([datetime.fromtimestamp(r[0], tz=timezone.utc).date() for r in rows])
+        pf, vf = np.ones(len(rows)), np.ones(len(rows))
+        for ex, p, v in events:
+            mask = days < ex
+            pf[mask] *= p
+            vf[mask] *= v
+        out = [(r[0], r[1] * pf[i], r[2] * pf[i], r[3] * pf[i], r[4] * pf[i], r[5] * vf[i]) for i, r in enumerate(rows)]
+        return out, [float(x) for x in pf]
+
+    def _events_for_chart(self, con, seg: str, sec: int) -> list[dict]:
+        try:
+            rows = con.execute("""SELECT action_id, event_type, ex_date, ratio_text, price_factor, verification_status, apply_adjustment,
+                                  application_status FROM corporate_actions WHERE exchange_segment = ? AND security_id = ? ORDER BY ex_date""",
+                               [seg, sec]).fetchall()
+        except duckdb.Error:
+            return []
+        return [{"action_id": r[0], "type": r[1], "ex_date": r[2].isoformat(), "ratio": r[3], "factor": r[4], "status": r[5],
+                 "adjusts": bool(r[6]) and r[5] == "verified", "application_status": r[7]} for r in rows]
+
     def candles(self, tf: str, security_id: int, *, start: date | None = None, end: date | None = None,
-                bars: int | None = None) -> dict:
+                bars: int | None = None, basis: str = "raw", as_of: date | None = None) -> dict:
+        if basis not in BASES:
+            raise ValueError(f"basis must be one of {', '.join(BASES)}")
         t = get_timeframe(tf)
         inst = self.resolve_instrument(security_id)
         if inst is None:
@@ -327,9 +385,22 @@ class DataAccess:
                     [seg, security_id, lo, hi]).fetchall()
             coverage = self._coverage(con, t, seg, security_id)
             warnings = self._warnings(con, t, seg, security_id, rows, coverage, start, end)
+            chart_events = self._events_for_chart(con, seg, security_id)
+            adjustment = {"basis": basis, "label": RAW_LABEL, "version": None, "as_of": None, "events_applied": [], "status": "raw"}
+            if basis == "adjusted":
+                events = ca.verified_events(con, seg, security_id, as_of=as_of)
+                rows, _ = self._adjust_rows(rows, events)
+                state = ca.adjustment_summary(con)
+                adjustment = {"basis": "adjusted", "label": ADJUSTED_LABEL + (f", as known on {as_of} (no look-ahead)" if as_of else ""),
+                              "version": state["version"], "as_of": as_of.isoformat() if as_of else None,
+                              "events_applied": [{"ex_date": e[0].isoformat(), "price_factor": e[1], "volume_factor": e[2]} for e in events],
+                              "status": "adjusted" if events else "no_verified_events", "note": state["basis_note"]}
+                if not events:
+                    adjustment["label"] += ": NO verified event applies to this instrument, so these values equal the raw ones"
         cols = list(zip(*rows)) if rows else [[]] * 6
         return {"timeframe": tf, "security_id": security_id, "symbol": inst["symbol"], "name": inst["name"],
                 "timezone": TIMEZONE_NOTE, "n": len(rows), "truncated": truncated,
+                "basis": basis, "adjustment": adjustment, "corporate_actions": chart_events,
                 "t": list(cols[0]), "o": list(cols[1]), "h": list(cols[2]), "l": list(cols[3]), "c": list(cols[4]),
                 "v": list(cols[5]), "flags": [{"t": f[0], "kind": f[1]} for f in flags],
                 "coverage": coverage, "warnings": warnings}
@@ -400,7 +471,9 @@ class DataAccess:
 
     # -- raw table -------------------------------------------------------------------------------------------------
     def table(self, tf: str, security_id: int, *, start: date | None, end: date | None, sort: str = "time",
-              desc: bool = True, page: int = 1, page_size: int = 100) -> dict:
+              desc: bool = True, page: int = 1, page_size: int = 100, basis: str = "raw", as_of: date | None = None) -> dict:
+        if basis not in BASES:
+            raise ValueError(f"basis must be one of {', '.join(BASES)}")
         t = get_timeframe(tf)
         inst = self.resolve_instrument(security_id)
         if inst is None:
@@ -408,6 +481,8 @@ class DataAccess:
         if sort not in TABLE_COLUMNS:
             raise ValueError(f"cannot sort by {sort!r}")
         col = TABLE_COLUMNS[sort] or t.key_col
+        if basis == "adjusted" and sort in ("open", "high", "low", "close", "volume"):
+            raise ValueError("sorting by a price or volume column is only available on the raw basis (adjusted values are derived per row)")
         page_size = max(1, min(page_size, 1000))
         page = max(1, page)
         where, params = self._bounds(tf, start, end)
@@ -418,16 +493,34 @@ class DataAccess:
                 f"""SELECT CAST({key} AS VARCHAR), open, high, low, close, volume, epoch_raw, window_id,
                            CAST(ingested_at_utc AS VARCHAR),
                            (SELECT string_agg(a.kind, ',') FROM data_anomalies a WHERE a.exchange_segment = c.exchange_segment
-                            AND a.security_id = c.security_id AND a.candle_key = CAST(c.{key} AS TIMESTAMP))
+                            AND a.security_id = c.security_id AND a.candle_key = CAST(c.{key} AS TIMESTAMP)),
+                           coalesce(c.provider, 'dhan'),
+                           (SELECT count(*) FROM candle_revisions r WHERE r.exchange_segment = c.exchange_segment
+                            AND r.security_id = c.security_id AND r.candle_key = CAST(c.{key} AS TIMESTAMP)),
+                           CAST(epoch(CAST({key} AS TIMESTAMP)) AS BIGINT)
                     FROM {t.table} c WHERE {where} ORDER BY {col} {'DESC' if desc else 'ASC'}, {key} LIMIT ? OFFSET ?""",
                 [inst["exchange_segment"], security_id, *params, page_size, (page - 1) * page_size]).fetchall()
-        keys = ("time", "open", "high", "low", "close", "volume", "epoch_raw", "window_id", "ingested_utc", "flags")
+            events = ca.verified_events(con, inst["exchange_segment"], security_id, as_of=as_of) if basis == "adjusted" else []
+        keys = ("time", "open", "high", "low", "close", "volume", "epoch_raw", "window_id", "ingested_utc", "flags", "provider", "revisions")
+        out_rows = []
+        for r in rows:
+            rec = dict(zip(keys, r[:12]))
+            if basis == "adjusted" and events:
+                (_, o, h, l, c, v), = self._adjust_rows([(r[12], rec["open"], rec["high"], rec["low"], rec["close"], rec["volume"])], events)[0]
+                rec.update(open=o, high=h, low=l, close=c, volume=v)
+            rec["basis"] = basis
+            out_rows.append(rec)
         return {"timeframe": tf, "symbol": inst["symbol"], "security_id": security_id, "total": total, "page": page,
-                "page_size": page_size, "timezone": TIMEZONE_NOTE, "rows": [dict(zip(keys, r)) for r in rows]}
+                "page_size": page_size, "timezone": TIMEZONE_NOTE, "basis": basis,
+                "label": RAW_LABEL if basis == "raw" else ADJUSTED_LABEL + (f", as known on {as_of}" if as_of else ""),
+                "rows": out_rows}
 
     def export_csv(self, tf: str, security_id: int, *, start: date | None, end: date | None,
-                   max_rows: int = 2_000_000) -> Iterator[bytes]:
-        """Streaming CSV of the stored candles exactly as stored (no synthesis, no adjustment)."""
+                   max_rows: int = 2_000_000, basis: str = "raw", as_of: date | None = None) -> Iterator[bytes]:
+        """Streaming CSV of the stored candles: exactly as stored (``basis=raw``, no synthesis, no adjustment) or split/bonus
+        adjusted from verified events only (``basis=adjusted``, optionally as known on ``as_of``). Every row says which."""
+        if basis not in BASES:
+            raise ValueError(f"basis must be one of {', '.join(BASES)}")
         t = get_timeframe(tf)
         inst = self.resolve_instrument(security_id)
         if inst is None:
@@ -435,16 +528,25 @@ class DataAccess:
         where, params = self._bounds(tf, start, end)
         key = t.key_col
         with self.connect(tf) as con:
-            cur = con.execute(f"SELECT CAST({key} AS VARCHAR), open, high, low, close, volume, epoch_raw FROM {t.table} "
+            events, version = [], 0
+            if basis == "adjusted":
+                events = ca.verified_events(con, inst["exchange_segment"], security_id, as_of=as_of)
+                version = ca.current_version(con)
+            label = "raw" if basis == "raw" else (f"adjusted_v{version}" + (f"_as_of_{as_of}" if as_of else "") + ("" if events else "_no_events"))
+            cur = con.execute(f"SELECT CAST({key} AS VARCHAR), open, high, low, close, volume, epoch_raw, coalesce(provider, 'dhan'), "
+                              f"CAST(epoch(CAST({key} AS TIMESTAMP)) AS BIGINT) FROM {t.table} "
                               f"WHERE {where} ORDER BY {key} LIMIT ?", [inst["exchange_segment"], security_id, *params, max_rows])
             buf = io.StringIO()
             w = csv.writer(buf)
-            w.writerow(["symbol", "security_id", "timeframe", f"{key}_ist", "open", "high", "low", "close", "volume", "epoch_raw"])
+            w.writerow(["symbol", "security_id", "timeframe", f"{key}_ist", "open", "high", "low", "close", "volume", "epoch_raw", "provider", "basis"])
             yield buf.getvalue().encode(); buf.seek(0); buf.truncate()
             while True:
                 chunk = cur.fetchmany(20_000)
                 if not chunk:
                     break
+                if events:
+                    adj, _ = self._adjust_rows([(r[8], r[1], r[2], r[3], r[4], r[5]) for r in chunk], events)
+                    chunk = [(r[0], a[1], a[2], a[3], a[4], a[5], r[6], r[7], r[8]) for r, a in zip(chunk, adj)]
                 for r in chunk:
-                    w.writerow([inst["symbol"], security_id, tf, *r])
+                    w.writerow([inst["symbol"], security_id, tf, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], label])
                 yield buf.getvalue().encode(); buf.seek(0); buf.truncate()

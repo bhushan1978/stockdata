@@ -27,8 +27,13 @@ from stockdata.web import jobs as J
 from stockdata.web.credentials import CredentialStore
 from stockdata.web.data import DataAccess, DatabaseBusy, DatabaseMissing, DbGate
 from stockdata.web.maintenance import Maintenance
+from stockdata.providers import PROVIDER_NAMES, get_provider
+from stockdata.web.corporate import CorporateActions
+from stockdata.web.automation import AutomationConfig, AutomationService, load_config, save_config
+from stockdata.web.providers import ProviderService
 from stockdata.web.system import SystemInfo
-from stockdata.web.quality import QualityRunner, coverage_csv
+from stockdata.web.live_status import build as live_status
+from stockdata.web.quality import QualityRunner, coverage_csv, lifecycle_report
 from stockdata.web.redact import redact
 from stockdata.web.settings import BOOTSTRAP_FILE, WebSettings, read_bootstrap, write_bootstrap
 from stockdata.web.store import ACTIVE, Store
@@ -63,8 +68,8 @@ class PlanOut(Loose):
     timeframe: str
     instruments: int
     windows: int
-    resolved_start: str
-    end_exclusive: str
+    resolved_start: str | None = None
+    end_exclusive: str | None = None
     warnings: list[dict] = []
     blockers: list[dict] = []
 
@@ -120,6 +125,88 @@ class ConfirmIn(BaseModel):
     confirm: bool = False
 
 
+class ProviderCredentialsIn(BaseModel):
+    values: dict[str, str] = Field(repr=False, description="credential field -> value; only the provider's own fields are accepted")
+
+
+class ProviderDefaultsIn(BaseModel):
+    default: str | None = None
+    by_timeframe: dict[str, str | None] | None = None
+    live_reserve: int | None = Field(default=None, ge=0, le=100_000)
+    confirm: bool = False
+
+
+class ProviderLimitsIn(BaseModel):
+    per_day: int | None = Field(default=None, ge=1)
+    per_run: int | None = Field(default=None, ge=1)
+    confirm: bool = False
+
+
+class ProbeIn(BaseModel):
+    symbol: str | None = Field(default=None, max_length=32, pattern=r"^[A-Za-z0-9&._\-]+$")
+    confirm: bool = False
+
+
+class EventIn(BaseModel):
+    symbol: str = Field(min_length=1, max_length=32, pattern=r"^[A-Za-z0-9&._\-]+$")
+    event_type: Literal["SPLIT", "BONUS", "RIGHTS", "DIVIDEND", "MERGER", "DEMERGER", "SYMBOL_CHANGE", "OTHER"]
+    ex_date: date
+    announcement_date: date | None = None
+    record_date: date | None = None
+    ratio_text: str = Field(default="", max_length=200)
+    old_face_value: float | None = Field(default=None, gt=0)
+    new_face_value: float | None = Field(default=None, gt=0)
+    bonus_new: float | None = Field(default=None, gt=0)
+    bonus_held: float | None = Field(default=None, gt=0)
+    rights_new: float | None = Field(default=None, gt=0)
+    rights_held: float | None = Field(default=None, gt=0)
+    issue_price: float | None = Field(default=None, gt=0)
+    cash_amount: float | None = Field(default=None, ge=0)
+    price_factor_override: float | None = Field(default=None, gt=0, description="a factor taken from an official circular (never inferred)")
+    volume_factor_override: float | None = Field(default=None, gt=0)
+    source: str = Field(default="manual entry", max_length=80)
+    source_ref: str = Field(min_length=3, max_length=300, description="the filing/circular reference or the URL it was taken from")
+    source_url: str | None = Field(default=None, max_length=500)
+    evidence: str | None = Field(default=None, max_length=1000)
+    source_confirmed: bool = False
+    confirm: bool = False
+
+
+class EventImportIn(BaseModel):
+    text: str = Field(max_length=6_000_000, repr=False)
+    format: Literal["nse", "reference"] = "nse"
+    source: str = Field(default="NSE corporate actions", max_length=80)
+    source_ref: str = Field(min_length=3, max_length=300)
+    source_confirmed: bool = False
+    confirm: bool = False
+
+
+class EvaluateIn(BaseModel):
+    timeframe: Literal["both", "daily", "15min"] = "both"
+    reference_csv: str | None = Field(default=None, max_length=2_000_000, repr=False)
+    confirm: bool = False
+
+
+class VerifyIn(BaseModel):
+    status: Literal["proposed", "verified", "source_adjusted", "unresolved", "recorded_not_adjusted", "rejected"]
+    note: str = Field(min_length=3, max_length=500)
+    confirm: bool = False
+
+
+class ApplyIn(BaseModel):
+    timeframe: Literal["both", "daily", "15min"] = "both"
+    confirm: bool = False
+
+
+class AutomationRunIn(BaseModel):
+    phase: Literal["post-close", "reconcile"] = "post-close"
+    confirm: bool = False
+
+
+class TaskActionIn(BaseModel):
+    confirm: bool = False
+
+
 class ShutdownIn(BaseModel):
     stop_jobs: bool = False
     confirm: bool = False
@@ -138,6 +225,10 @@ def create_app(settings: WebSettings, *, start_scheduler: bool = True) -> FastAP
     quality = QualityRunner(data, store)
     maint = Maintenance(settings.data_dir, data, store)
     sysinfo = SystemInfo(settings, sup, data, creds)
+    providers = ProviderService(settings, store, creds, sup, data, gate)
+    automation = AutomationService(settings, store, sup, data, gate)
+    corporate = CorporateActions(data, store)
+    data.ensure_schema(lambda tf: sup.writer_for(tf) is not None)         # an older database gains the additive columns once
     if start_scheduler:
         sup.start()
     else:
@@ -152,6 +243,7 @@ def create_app(settings: WebSettings, *, start_scheduler: bool = True) -> FastAP
     app = FastAPI(title="Stock Data Management Center", version=settings.version, docs_url="/api/docs",
                   redoc_url=None, openapi_url="/api/openapi.json", lifespan=lifespan)
     app.state.sup, app.state.store, app.state.data, app.state.creds, app.state.settings = sup, store, data, creds, settings
+    app.state.automation, app.state.gate = automation, gate
     app.state.server = None            # set by __main__ (uvicorn server) so shutdown can stop it
 
     hosts = LOOPBACK | set(settings.extra_hosts)
@@ -238,6 +330,14 @@ def create_app(settings: WebSettings, *, start_scheduler: bool = True) -> FastAP
     def api_usage() -> dict:
         return sup.usage()
 
+    def provider_overview() -> dict:
+        """Which provider supplies what, and whether each one in use can start a job right now (offline: nothing is contacted)."""
+        eff = sup.effective()
+        in_use = {eff["provider_default"], *eff["provider_by_timeframe"].values()}
+        return {"default": eff["provider_default"], "by_timeframe": eff["provider_by_timeframe"],
+                "readiness": [{"provider": n, "label": get_provider(n).label, "in_use": n in in_use, "problem": sup.provider_ready(n),
+                               "state": creds.provider_status(n)["auth"]["state"]} for n in PROVIDER_NAMES]}
+
     @app.get("/api/overview", tags=["system"])
     def api_overview() -> dict:
         summaries = {tf: data.summary(tf) for tf in TIMEFRAMES}
@@ -255,7 +355,7 @@ def create_app(settings: WebSettings, *, start_scheduler: bool = True) -> FastAP
                 "pending_note": "windows still to request in unfinished jobs (from their own plans); not an estimate of the whole universe",
                 "outstanding_failed_windows": outstanding, "active": [j for j in jobs if j["status"] in ACTIVE],
                 "resumable": resumable, "last_successful_job": last_ok[0] if last_ok else None,
-                "credentials": creds.status(), "paths": {"data_dir": str(settings.data_dir)}}
+                "credentials": creds.status(), "paths": {"data_dir": str(settings.data_dir)}, "providers": provider_overview()}
 
     @app.post("/api/system/shutdown", tags=["system"])
     def api_shutdown(body: ShutdownIn) -> dict:
@@ -286,13 +386,13 @@ def create_app(settings: WebSettings, *, start_scheduler: bool = True) -> FastAP
     def api_create_job(body: CreateJobIn) -> dict:
         need_confirm(body.confirm, "Adding a job")
         plan = None
-        if body.spec.kind == "download":
+        if body.spec.kind in J.SESSION_KINDS:
             try:
                 p = sup.preview(body.spec)
                 if p["blockers"] and body.start == "now":
                     raise JobError("Cannot start now: " + "; ".join(b["message"] for b in p["blockers"]), 409)
-                plan = {k: p[k] for k in ("instruments", "instruments_with_work", "windows", "resolved_start", "end_exclusive",
-                                          "window_days", "estimated_seconds", "rps")}
+                plan = {k: p.get(k) for k in ("instruments", "instruments_with_work", "windows", "resolved_start", "end_exclusive",
+                                              "window_days", "estimated_seconds", "rps")}
             except DatabaseBusy:
                 plan = None            # the database is being written; the job keeps its own plan once it starts
         job = sup.create_job(body.spec, plan=plan)
@@ -421,6 +521,11 @@ def create_app(settings: WebSettings, *, start_scheduler: bool = True) -> FastAP
         sup.delete_campaign(campaign_id)
         return {"deleted": campaign_id}
 
+    # ============================================================================ live / current workflow
+    @app.get("/api/live", tags=["live"])
+    def api_live() -> dict:
+        return live_status(sup, data)
+
     # ============================================================================ data
     @app.get("/api/catalog", tags=["data"])
     def api_catalog(refresh: bool = False) -> dict:
@@ -479,33 +584,44 @@ def create_app(settings: WebSettings, *, start_scheduler: bool = True) -> FastAP
                                                                         "timeframe": j["timeframe"]} for j in related]}
 
     @app.post("/api/instruments/refresh", tags=["data"])
-    def api_refresh_master(confirm: bool = Body(embed=True, default=False)) -> dict:
+    def api_refresh_master(confirm: bool = Body(embed=True, default=False),
+                           kind: Literal["compact", "detailed"] = Body(embed=True, default="compact")) -> dict:
         need_confirm(confirm, "Refreshing the instrument master (downloads Dhan's public master CSV and rewrites the instrument tables of both databases)")
-        job = sup.create_job(J.JobSpec(kind="instruments_load"), allow_duplicate=True)
+        job = sup.create_job(J.JobSpec(kind="instruments_load", master_kind=kind), allow_duplicate=True)
         job, reason = sup.start_now(job["id"])
         return {"job": sup.job_view(job), "waiting_reason": reason}
 
     @app.get("/api/candles", tags=["data"])
     def api_candles(timeframe: Timeframe, security_id: int, start: date | None = None, end: date | None = None,
-                    bars: int | None = Query(None, ge=1, le=150_000)) -> dict:
-        return data.candles(timeframe, security_id, start=start, end=end, bars=bars)
+                    bars: int | None = Query(None, ge=1, le=150_000), basis: Literal["raw", "adjusted"] = "raw",
+                    as_of: date | None = Query(None, description="adjusted basis only: use only events effective on or before this date (no look-ahead)")) -> dict:
+        if as_of and basis != "adjusted":
+            raise JobError("as_of applies to the adjusted basis only", 400)
+        return data.candles(timeframe, security_id, start=start, end=end, bars=bars, basis=basis, as_of=as_of)
 
     @app.get("/api/candles/table", tags=["data"])
     def api_candle_table(timeframe: Timeframe, security_id: int, start: date | None = None, end: date | None = None,
                          sort: str = "time", desc: bool = True, page: int = Query(1, ge=1),
-                         page_size: int = Query(100, ge=1, le=1000)) -> dict:
-        return data.table(timeframe, security_id, start=start, end=end, sort=sort, desc=desc, page=page, page_size=page_size)
+                         page_size: int = Query(100, ge=1, le=1000), basis: Literal["raw", "adjusted"] = "raw",
+                         as_of: date | None = None) -> dict:
+        if as_of and basis != "adjusted":
+            raise JobError("as_of applies to the adjusted basis only", 400)
+        return data.table(timeframe, security_id, start=start, end=end, sort=sort, desc=desc, page=page, page_size=page_size,
+                          basis=basis, as_of=as_of)
 
     @app.get("/api/candles/export.csv", tags=["data"])
-    def api_candle_csv(timeframe: Timeframe, security_id: int, start: date | None = None, end: date | None = None):
+    def api_candle_csv(timeframe: Timeframe, security_id: int, start: date | None = None, end: date | None = None,
+                       basis: Literal["raw", "adjusted"] = "raw", as_of: date | None = None):
+        if as_of and basis != "adjusted":
+            raise JobError("as_of applies to the adjusted basis only", 400)
         inst = data.resolve_instrument(security_id)
         if inst is None:
             raise KeyError(f"security id {security_id} is not in the loaded universe")
         # open the gate first so a busy database is reported as a clean error instead of a broken download
         with data.connect(timeframe):
             pass
-        name = f"{inst['symbol']}_{timeframe}_{start or 'start'}_{end or 'end'}.csv"
-        return StreamingResponse(data.export_csv(timeframe, security_id, start=start, end=end), media_type="text/csv",
+        name = f"{inst['symbol']}_{timeframe}_{basis}{'_as_of_' + str(as_of) if as_of else ''}_{start or 'start'}_{end or 'end'}.csv"
+        return StreamingResponse(data.export_csv(timeframe, security_id, start=start, end=end, basis=basis, as_of=as_of), media_type="text/csv",
                                  headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
     # ---- groups
@@ -550,6 +666,10 @@ def create_app(settings: WebSettings, *, start_scheduler: bool = True) -> FastAP
     def api_quality_cancel(timeframe: Timeframe) -> dict:
         quality.cancel(timeframe)
         return quality.state(timeframe)
+
+    @app.get("/api/lifecycle/{timeframe}", tags=["quality"])
+    def api_lifecycle(timeframe: Timeframe) -> dict:
+        return lifecycle_report(data, timeframe)
 
     @app.get("/api/quality/{timeframe}/coverage.csv", tags=["quality"])
     def api_coverage_csv(timeframe: Timeframe):
@@ -652,6 +772,156 @@ def create_app(settings: WebSettings, *, start_scheduler: bool = True) -> FastAP
         store.audit("settings.data_dir", None, {"to": info["path"], "from": str(settings.data_dir)})
         return {"saved": True, "restart_required": True, "new_data_dir": info["path"], "current_data_dir": str(settings.data_dir),
                 "message": f"Saved to {BOOTSTRAP_FILE}. Nothing changes until the server is restarted; running downloads keep using the current folder."}
+
+    # ============================================================================ providers
+    @app.get("/api/providers", tags=["providers"])
+    def api_providers() -> dict:
+        return providers.overview()
+
+    @app.put("/api/providers/defaults", tags=["providers"])
+    def api_provider_defaults(body: ProviderDefaultsIn) -> dict:
+        need_confirm(body.confirm, "Changing the default provider")
+        out = providers.set_defaults(default=body.default, by_timeframe=body.by_timeframe, live_reserve=body.live_reserve)
+        sup.wake()
+        return out
+
+    @app.get("/api/providers/{name}", tags=["providers"])
+    def api_provider(name: str) -> dict:
+        if name not in PROVIDER_NAMES:
+            raise KeyError(f"unknown provider {name}")
+        return next(p for p in providers.overview()["providers"] if p["provider"] == name)
+
+    @app.get("/api/providers/{name}/checks", tags=["providers"])
+    def api_provider_checks(name: str, kind: str | None = None) -> list[dict]:
+        if name not in PROVIDER_NAMES:
+            raise KeyError(f"unknown provider {name}")
+        return providers.checks(name, kind, 20)
+
+    @app.put("/api/providers/{name}/credentials", tags=["providers"])
+    def api_provider_credentials(name: str, body: ProviderCredentialsIn) -> dict:
+        if name not in PROVIDER_NAMES:
+            raise KeyError(f"unknown provider {name}")
+        try:
+            status = creds.update_provider(name, body.values)
+        except ValueError as exc:
+            raise JobError(str(exc), 400)
+        store.audit("credentials.update", f"provider:{name}", {"fields": sorted(k for k, v in body.values.items() if v)})
+        sup.wake()
+        return status
+
+    @app.delete("/api/providers/{name}/credentials", tags=["providers"])
+    def api_provider_credentials_clear(name: str, confirm: bool = False) -> dict:
+        if name not in PROVIDER_NAMES:
+            raise KeyError(f"unknown provider {name}")
+        need_confirm(confirm, "Removing stored credentials")
+        status = creds.clear_provider(name)
+        store.audit("credentials.clear", f"provider:{name}")
+        return status
+
+    @app.post("/api/providers/{name}/test", tags=["providers"])
+    def api_provider_test(name: str, body: ConfirmIn) -> dict:
+        if name not in PROVIDER_NAMES:
+            raise KeyError(f"unknown provider {name}")
+        need_confirm(body.confirm, "Testing a connection (it sends one request to the provider and counts it)")
+        return providers.test_connection(name)
+
+    @app.post("/api/providers/{name}/probe", tags=["providers"])
+    def api_provider_probe(name: str, body: ProbeIn) -> dict:
+        if name not in PROVIDER_NAMES:
+            raise KeyError(f"unknown provider {name}")
+        need_confirm(body.confirm, "A capability probe (it sends about a dozen counted requests to the provider)")
+        return providers.probe(name, body.symbol)
+
+    @app.put("/api/providers/{name}/limits", tags=["providers"])
+    def api_provider_limits(name: str, body: ProviderLimitsIn) -> dict:
+        if name not in PROVIDER_NAMES:
+            raise KeyError(f"unknown provider {name}")
+        need_confirm(body.confirm, "Changing a provider's request limits")
+        return providers.set_limits(name, per_day=body.per_day, per_run=body.per_run)
+
+    # ============================================================================ corporate actions
+    @app.get("/api/corporate-actions", tags=["corporate-actions"])
+    def api_corp_list(status: str | None = None, symbol: str | None = None) -> dict:
+        return corporate.listing(status=status, symbol=symbol)
+
+    @app.get("/api/corporate-actions/summary", tags=["corporate-actions"])
+    def api_corp_summary() -> dict:
+        return corporate.summary()
+
+    @app.post("/api/corporate-actions", tags=["corporate-actions"])
+    def api_corp_add(body: EventIn) -> dict:
+        need_confirm(body.confirm, "Recording a corporate action")
+        row = {k: v for k, v in body.model_dump(mode="json").items() if v is not None and k not in ("source", "source_ref", "source_confirmed", "confirm")}
+        return corporate.add([row], source=body.source, source_ref=body.source_ref, source_confirmed=body.source_confirmed)
+
+    @app.post("/api/corporate-actions/import", tags=["corporate-actions"])
+    def api_corp_import(body: EventImportIn) -> dict:
+        need_confirm(body.confirm, "Importing corporate actions")
+        return corporate.import_csv(body.text, fmt=body.format, source=body.source, source_ref=body.source_ref, source_confirmed=body.source_confirmed)
+
+    @app.post("/api/corporate-actions/evaluate", tags=["corporate-actions"])
+    def api_corp_evaluate(body: EvaluateIn) -> dict:
+        need_confirm(body.confirm, "Verifying events against the stored candles")
+        return corporate.evaluate(body.timeframe, body.reference_csv)
+
+    @app.post("/api/corporate-actions/apply", tags=["corporate-actions"])
+    def api_corp_apply(body: ApplyIn) -> dict:
+        need_confirm(body.confirm, "Building the adjusted view (raw candles are not changed)")
+        return corporate.apply(body.timeframe)
+
+    @app.post("/api/corporate-actions/scan", tags=["corporate-actions"])
+    def api_corp_scan(body: ApplyIn) -> dict:
+        need_confirm(body.confirm, "Scanning for gaps that look like unrecorded events")
+        return corporate.scan(body.timeframe)
+
+    @app.get("/api/corporate-actions/{action_id}", tags=["corporate-actions"])
+    def api_corp_detail(action_id: str) -> dict:
+        return corporate.detail(action_id)
+
+    @app.post("/api/corporate-actions/{action_id}/verify", tags=["corporate-actions"])
+    def api_corp_verify(action_id: str, body: VerifyIn) -> dict:
+        need_confirm(body.confirm, "A verification decision")
+        return corporate.verify(action_id, body.status, body.note)
+
+    # ============================================================================ automation
+    @app.get("/api/automation", tags=["automation"])
+    def api_automation() -> dict:
+        return automation.status()
+
+    @app.put("/api/automation/config", tags=["automation"])
+    def api_automation_config(body: AutomationConfig) -> dict:
+        for tf_name in body.timeframes:
+            prov = body.provider or sup.default_provider(tf_name)
+            if not get_provider(prov).supports(TIMEFRAMES[tf_name]):
+                raise JobError(f"{get_provider(prov).label} does not provide {tf_name} candles", 400)
+        save_config(store, body)
+        return automation.status()
+
+    @app.get("/api/automation/runs", tags=["automation"])
+    def api_automation_runs(limit: int = Query(20, ge=1, le=200)) -> list[dict]:
+        return automation.runs(limit)
+
+    @app.get("/api/automation/plan", tags=["automation"])
+    def api_automation_plan() -> dict:
+        return automation.plan()
+
+    @app.get("/api/automation/task/xml", tags=["automation"])
+    def api_automation_xml() -> list[dict]:
+        return automation.xml_preview()
+
+    @app.post("/api/automation/task/{action}", tags=["automation"])
+    def api_automation_task(action: Literal["install", "remove", "enable", "disable"], body: TaskActionIn) -> dict:
+        need_confirm(body.confirm, f"{action.capitalize()} of the scheduled tasks")
+        if action == "install":
+            return automation.install()
+        if action == "remove":
+            return automation.remove()
+        return automation.set_enabled(action == "enable")
+
+    @app.post("/api/automation/run", tags=["automation"])
+    def api_automation_run(body: AutomationRunIn) -> dict:
+        need_confirm(body.confirm, "An automatic update run (it requests data from the provider and counts every request)")
+        return automation.run_now(body.phase)
 
     @app.get("/api/credentials", tags=["settings"])
     def api_creds() -> dict:

@@ -1,8 +1,16 @@
 """Job definitions: validation, the exact engine command line, duplicate fingerprints and exit-code mapping.
 
 A job is never free text: only the allow-listed fields below can reach the engine command line, and the command is
-always ``python -m stockdata download|instruments ...`` (the existing CLI). Values are passed as separate argv items
-(never through a shell)."""
+always ``python -m stockdata download|update|refresh|instruments ...`` (the existing CLI). Values are passed as separate
+argv items (never through a shell).
+
+Two lanes of work are kept apart on purpose:
+
+* **historical** - ``download`` (backfill a selected date range, missing data only), ``refresh`` (an explicit, validated,
+  audited repair that replaces stored candles) and ``instruments_load``;
+* **live** - ``update`` (incremental post-close update from the last stored candle, never history) and ``poll`` (completed
+  bars of the session in progress, provisional).
+"""
 from __future__ import annotations
 
 import hashlib
@@ -65,9 +73,28 @@ class Selection(BaseModel):
         return self
 
 
+PROVIDER_NAMES = ("dhan", "fyers", "upstox")
+KINDS = ("download", "instruments_load", "update", "poll", "refresh")
+LIVE_KINDS = ("update", "poll")
+SESSION_KINDS = ("download", "update", "poll", "refresh")          # kinds that name a timeframe and a selection
+
+
+def lane_of(kind: str) -> str:
+    return "live" if kind in LIVE_KINDS else "historical"
+
+
 class JobSpec(BaseModel):
-    kind: Literal["download", "instruments_load"] = "download"
+    kind: Literal["download", "instruments_load", "update", "poll", "refresh"] = "download"
     timeframe: Literal["daily", "15min"] | None = None
+    provider: Literal["dhan", "fyers", "upstox"] | None = Field(default=None, description="data provider; None = the configured default")
+    overlap_days: int | None = Field(default=None, ge=0, le=60, description="update: days before the last candle to re-request")
+    seed_days: int | None = Field(default=None, ge=1, le=60, description="update: recent days for an instrument with no data")
+    poll_seconds: int = Field(default=300, ge=60, le=3600, description="poll: seconds between polls")
+    max_cycles: int | None = Field(default=None, ge=1, le=500, description="poll: stop after this many polls")
+    allow_cross_provider: bool = Field(default=False, description="refresh: allow replacing candles stored from another provider")
+    refresh_mode: Literal["replace", "fill_gaps"] = Field(default="replace", description="repair: replace differing candles (explicit, audited) or only add missing ones")
+    fill_provider_gaps: bool = Field(default=False, description="download: also request ranges another provider found empty")
+    master_kind: Literal["compact", "detailed"] = Field(default="compact", description="instruments_load: the detailed master carries ISINs (needed for Upstox)")
     name: str | None = Field(default=None, max_length=120)
     selection: Selection | None = None
     start_date: date | None = None
@@ -96,17 +123,32 @@ class JobSpec(BaseModel):
 
     @model_validator(mode="after")
     def _consistent(self):
-        if self.kind == "download":
+        if self.kind in SESSION_KINDS:
             if self.timeframe is None:
-                raise ValueError("timeframe is required for a download")
+                raise ValueError(f"timeframe is required for a {self.kind}")
             if self.selection is None:
                 raise ValueError("a selection is required")
+        if self.kind == "download":
             if self.selection.mode == "all" and not self.confirm_full:
                 raise ValueError("a whole-universe download needs explicit confirmation (confirm_full)")
             if self.empty_error_codes and not self.retry_failed:
                 raise ValueError("empty_error_codes only applies together with retry_failed")
             if self.empty_error_codes and self.selection.mode == "all":
                 raise ValueError("recording failures as 'empty' must name reviewed instruments, never the whole universe")
+        elif self.empty_error_codes:
+            raise ValueError("empty_error_codes only applies to a historical download")
+        if self.kind in LIVE_KINDS and (self.start_date or self.end_date):
+            raise ValueError("a live update has no date range: it continues from the last stored candle")
+        if self.kind == "poll":
+            if self.timeframe != "15min":
+                raise ValueError("current-session polling is for 15-minute data (a daily candle is final only after the close)")
+            if self.selection.mode == "all" and not self.confirm_full:
+                raise ValueError("polling the whole universe sends one request per instrument per poll; it needs explicit confirmation")
+        if self.kind == "refresh":
+            if self.selection.mode == "all":
+                raise ValueError("a repair names its instruments; there is no whole-universe repair")
+            if self.start_date is None:
+                raise ValueError("a repair needs a start date")
         if self.start_date and self.start_date < EARLIEST_DATE:
             raise ValueError("start date is before 1990-01-01")
         if self.start_date and self.end_date and self.start_date >= self.end_date:
@@ -119,6 +161,7 @@ def canonical(spec: JobSpec, security_ids: list[int] | None = None) -> dict:
     sel = spec.selection
     return {
         "kind": spec.kind, "timeframe": spec.timeframe,
+        **({"master_kind": spec.master_kind} if spec.kind == "instruments_load" else {}),
         "selection": None if sel is None else {
             "mode": sel.mode, "limit": sel.limit,
             "symbols": sorted(sel.symbols) if sel.mode == "symbols" else [],
@@ -127,6 +170,11 @@ def canonical(spec: JobSpec, security_ids: list[int] | None = None) -> dict:
         "start_date": spec.start_date.isoformat() if spec.start_date else None,
         "end_date": spec.end_date.isoformat() if spec.end_date else None,
         "retry_failed": spec.retry_failed, "empty_error_codes": sorted(spec.empty_error_codes),
+        "provider": spec.provider,
+        **({"overlap_days": spec.overlap_days, "seed_days": spec.seed_days} if spec.kind == "update" else {}),
+        **({"poll_seconds": spec.poll_seconds, "max_cycles": spec.max_cycles} if spec.kind == "poll" else {}),
+        **({"allow_cross_provider": spec.allow_cross_provider, "refresh_mode": spec.refresh_mode} if spec.kind == "refresh" else {}),
+        **({"fill_provider_gaps": spec.fill_provider_gaps} if spec.kind == "download" and spec.fill_provider_gaps else {}),
     }
 
 
@@ -136,7 +184,7 @@ def fingerprint(spec: JobSpec, security_ids: list[int] | None = None) -> str:
 
 def default_name(spec: JobSpec, security_ids: list[int] | None = None) -> str:
     if spec.kind == "instruments_load":
-        return "Refresh instrument master"
+        return "Refresh instrument master" + (" (detailed, with ISINs)" if spec.master_kind == "detailed" else "")
     sel = spec.selection
     tf = "Daily" if spec.timeframe == "daily" else "15-minute"
     if sel.mode == "all":
@@ -147,7 +195,9 @@ def default_name(spec: JobSpec, security_ids: list[int] | None = None) -> str:
         n = len(security_ids if security_ids is not None else sel.security_ids)
         what = f"{n} instrument{'s' if n != 1 else ''}"
     extra = " (retry failed)" if spec.retry_failed else ""
-    return f"{tf} - {what}{extra}"
+    prefix = {"update": "Update ", "poll": "Poll ", "refresh": "Fill gaps: " if spec.refresh_mode == "fill_gaps" else "Repair "}.get(spec.kind, "")
+    suffix = {"update": " (post-close)", "poll": " (current session)"}.get(spec.kind, "")
+    return f"{prefix}{tf} - {what}{suffix}{extra}" if prefix else f"{tf} - {what}{extra}"
 
 
 def engine_args(spec: JobSpec, *, data_dir: str, security_ids: list[int] | None = None,
@@ -155,17 +205,28 @@ def engine_args(spec: JobSpec, *, data_dir: str, security_ids: list[int] | None 
     """Arguments after ``python -m stockdata`` - the same command a person would type."""
     args = ["--data-dir", data_dir]
     if spec.kind == "instruments_load":
-        return args + ["instruments", "load", "--fetch"]
+        return args + ["instruments", "load", "--fetch"] + (["--kind", "detailed"] if spec.master_kind == "detailed" else [])
     sel = spec.selection
-    args += ["download", spec.timeframe]
+    verb = {"download": "download", "update": "update", "poll": "update", "refresh": "refresh"}[spec.kind]
+    args += [verb, spec.timeframe]
+    if spec.kind == "poll":
+        args += ["--mode", "current", "--poll-seconds", str(spec.poll_seconds)]
+        if spec.max_cycles:
+            args += ["--max-cycles", str(spec.max_cycles)]
+    elif spec.kind == "update":
+        args += ["--mode", "post-close"]
+        if spec.overlap_days is not None:
+            args += ["--overlap-days", str(spec.overlap_days)]
+        if spec.seed_days:
+            args += ["--seed-days", str(spec.seed_days)]
     if sel.mode == "all":
-        args += ["--all", "--confirm-full-download"]
+        args += ["--all"] + (["--confirm-full-download"] if spec.kind == "download" else [])
     elif sel.mode == "symbols":
         args += ["--symbols", ",".join(sel.symbols)]
     else:
         ids = security_ids if security_ids is not None else sel.security_ids
         args += ["--security-ids", ",".join(str(i) for i in ids)]
-    if sel.limit:
+    if sel.limit and spec.kind != "refresh":
         args += ["--limit", str(sel.limit)]
     if spec.start_date:
         args += ["--start-date", spec.start_date.isoformat()]
@@ -175,6 +236,14 @@ def engine_args(spec: JobSpec, *, data_dir: str, security_ids: list[int] | None 
         args.append("--retry-failed")
     if spec.empty_error_codes:
         args += ["--empty-error-codes", ",".join(spec.empty_error_codes)]
+    if spec.kind == "refresh" and spec.refresh_mode == "fill_gaps":
+        args.append("--fill-only")
+    if spec.kind == "refresh" and spec.allow_cross_provider and spec.refresh_mode == "replace":
+        args.append("--allow-cross-provider")
+    if spec.kind == "download" and spec.fill_provider_gaps:
+        args.append("--fill-provider-gaps")
+    if spec.provider:
+        args += ["--provider", spec.provider]
     if rps:
         args += ["--rps", f"{rps:g}"]
     if max_per_run:

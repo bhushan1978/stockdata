@@ -14,11 +14,14 @@ from stockdata import config, jobcontrol
 from stockdata.budget import COUNTER_CAVEAT, RequestBudget, UsageLedger, read_usage, validate_limits
 from stockdata.config import Settings
 from stockdata.db import CandleDB
-from stockdata.dhan import DhanClient, RateLimiter
+import os
+
+from stockdata.providers import PROVIDER_NAMES, get_provider, ledger_label
 from stockdata.downloader import Downloader, select_instruments
 from stockdata.plan import PlanError, build_download_plan
 from stockdata.instruments import (UniverseSpec, normalize_master, read_master, select_universe,
                                    sha256_of, summarize)
+from stockdata import live
 from stockdata.refresh import RefreshOptions, Refresher
 from stockdata.reports import format_report, status_text
 from stockdata.timeframes import TIMEFRAMES, Timeframe, get_timeframe
@@ -31,15 +34,25 @@ def db_path(settings: Settings, tf: Timeframe) -> Path:
     return settings.daily_db_path if tf.name == "daily" else settings.intraday_db_path
 
 
-EXIT_CODES = {"completed": 0, "completed_with_errors": 2, "completed_with_issues": 2, "stopped_request_limit": 4,
+EXIT_CODES = {"completed": 0, "market_closed": 0, "completed_with_errors": 2, "completed_with_issues": 2, "stopped_request_limit": 4,
               "stopped_by_user": 5}   # 5: a supervisor (the web application) asked for a stop; resume = same command
 
 
+def provider_name(settings: Settings, args=None) -> str:
+    return (getattr(args, "provider", None) or settings.provider or "dhan").lower()
+
+
 def apply_limit_args(settings: Settings, args) -> Settings:
-    """Command-line request limits override the environment/defaults; invalid values stop the run early."""
+    """Command-line request limits override the environment/defaults; invalid values stop the run early.
+
+    Each provider has its own account-wide limits, so when the provider is not Dhan and nobody set a daily cap explicitly,
+    that provider's own (conservative) operating cap applies instead of Dhan's 80,000."""
     per_run = getattr(args, "max_requests_per_run", None)
     per_day = getattr(args, "max_requests_per_day", None)
     per_run = settings.max_requests_per_run if per_run is None else per_run     # an explicit 0 must be rejected, not defaulted
+    prov = provider_name(settings, args)
+    if per_day is None and prov != "dhan" and "STOCKDATA_MAX_REQUESTS_PER_DAY" not in os.environ:
+        per_day = get_provider(prov).capabilities().rate_limit.operating_day_cap
     per_day = settings.max_requests_per_day if per_day is None else per_day
     try:
         validate_limits(per_run, per_day)
@@ -48,19 +61,22 @@ def apply_limit_args(settings: Settings, args) -> Settings:
     return dataclasses.replace(settings, max_requests_per_run=per_run, max_requests_per_day=per_day)
 
 
-def make_client(settings: Settings, label: str, *, max_attempts: int = 5) -> DhanClient:
-    """Every API client of this application is created here, so every attempt is counted in the shared ledger."""
-    token = settings.require_token()
-    budget = RequestBudget(UsageLedger(settings.request_ledger_path), label,
-                           max_per_run=settings.max_requests_per_run, max_per_day=settings.max_requests_per_day)
-    return DhanClient(token, settings.base_url, client_id=settings.client_id, limiter=RateLimiter(settings.rps),
-                      max_attempts=max_attempts, budget=budget)
+def make_client(settings: Settings, label: str, *, max_attempts: int = 5, provider: str | None = None):
+    """Every API client of this application is created here, so every attempt is counted in the shared ledger.
+
+    ``label`` is the timeframe name; the ledger label adds the provider (Dhan keeps its historical bare labels)."""
+    name = (provider or settings.provider or "dhan").lower()
+    adapter = get_provider(name)
+    budget = RequestBudget(UsageLedger(settings.request_ledger_path), ledger_label(name, label),
+                           max_per_run=settings.max_requests_per_run, max_per_day=settings.max_requests_per_day, provider=name)
+    return adapter.make_client(os.environ, settings=settings, label=label, budget=budget, max_attempts=max_attempts)
 
 
-def usage_line(settings: Settings, planned: int | None = None) -> str:
-    today = read_usage(settings.request_ledger_path)
+def usage_line(settings: Settings, planned: int | None = None, provider: str | None = None) -> str:
+    name = (provider or settings.provider or "dhan").lower()
+    today = read_usage(settings.request_ledger_path, provider=name)
     used = sum(today.values())
-    text = (f"request limits: {settings.max_requests_per_run:,} per run, {settings.max_requests_per_day:,} per IST day; "
+    text = (f"{name} request limits: {settings.max_requests_per_run:,} per run, {settings.max_requests_per_day:,} per IST day; "
             f"used today {used:,} ({', '.join(f'{k}={v:,}' for k, v in today.items()) or 'none'})")
     if planned is not None:
         room = min(settings.max_requests_per_run, settings.max_requests_per_day - used)
@@ -157,7 +173,8 @@ def cmd_instruments_load(args, settings: Settings) -> int:
 def cmd_download(args, settings: Settings) -> int:
     tf = get_timeframe(args.timeframe)
     if args.rps:
-        settings = dataclasses.replace(settings, rps=args.rps)
+        settings = dataclasses.replace(settings, rps=args.rps, rps_override=args.rps)
+    prov = provider_name(settings, args)
     settings = apply_limit_args(settings, args)
     path = db_path(settings, tf)
     if args.dry_run and not path.exists():
@@ -174,22 +191,30 @@ def cmd_download(args, settings: Settings) -> int:
                 select_all=args.all, limit=args.limit, start_date=args.start_date, end_date=args.end_date,
                 window_days=args.window_days, overlap_days=args.overlap_days, refetch=args.refetch,
                 retry_failed=args.retry_failed, empty_error_codes=frozenset(csv_list(args.empty_error_codes) or []),
-                persist_history_start=not args.dry_run, with_windows=args.dry_run or control is not None)
+                persist_history_start=not args.dry_run, with_windows=args.dry_run or control is not None,
+                provider=prov, foreign_empty_is_gap=args.fill_provider_gaps)
         except PlanError as exc:
             raise SystemExit(str(exc))
         opts, insts = plan.opts, plan.instruments
+        adapter = get_provider(prov)
         print(f"{tf.name}: {len(insts)} instrument(s), range [{opts.history_start:%Y-%m-%d}, {opts.cutoff:%Y-%m-%d}) "
-              f"exclusive end, windows of <= {opts.window_days} days, {settings.rps:g} req/s")
+              f"exclusive end, windows of <= {opts.window_days} days, {settings.rps:g} req/s; provider: {adapter.label}")
+        for note in plan.notes:
+            print(f"note: {note}")
+        if plan.unmapped:
+            names = ", ".join(i.symbol for i in plan.unmapped[:8])
+            print(f"WARNING: {len(plan.unmapped)} instrument(s) have no {adapter.label} identifier and are skipped ({names}"
+                  f"{', ...' if len(plan.unmapped) > 8 else ''}); nothing is requested or recorded for them")
         if args.dry_run:
             total = plan.requests
             eta = timedelta(seconds=total / settings.rps)
             print(f"dry run: {total:,} request(s) would be made (~{eta} at the configured rate, before any retries); nothing sent.")
-            print(usage_line(settings, planned=total))
+            print(usage_line(settings, planned=total, provider=prov))
             return 0
         if control is not None:
             control.report("plan", instruments=len(insts), windows=plan.requests)
-        client = make_client(settings, tf.name, max_attempts=args.max_attempts)
-        stats = Downloader(db, client, control=control).run(insts, opts, command=f"download {tf.name}")
+        client = make_client(settings, tf.name, max_attempts=args.max_attempts, provider=prov)
+        stats = Downloader(db, client, control=control, provider=adapter).run(insts, opts, command=f"download {tf.name} --provider {prov}")
         done = {k: v for k, v in stats.items() if k not in ("results", "instruments", "note")}
         print(f"\nrun {stats['status']}: {done}")
         if stats["note"]:
@@ -202,11 +227,92 @@ def cmd_download(args, settings: Settings) -> int:
         return EXIT_CODES.get(stats["status"], 3)
 
 
+# -------------------------------------------------------------------- update
+def cmd_update(args, settings: Settings) -> int:
+    """Live/current data: bring existing datasets up to date. Never downloads history (see stockdata/live.py)."""
+    tf = get_timeframe(args.timeframe)
+    if args.rps:
+        settings = dataclasses.replace(settings, rps=args.rps, rps_override=args.rps)
+    prov = provider_name(settings, args)
+    adapter = get_provider(prov)
+    if not adapter.supports(tf):
+        raise SystemExit(f"{adapter.label} does not provide {tf.name} candles")
+    settings = apply_limit_args(settings, args)
+    path = db_path(settings, tf)
+    if not path.exists():
+        raise SystemExit(f"{path} does not exist; load the instruments and run a historical download first")
+    mode = args.mode.replace("-", "_")
+    if mode == live.CURRENT and not tf.is_intraday:
+        raise SystemExit("current-session polling is for intraday data; a daily candle is final only after the close "
+                         "(use the post-close update)")
+    with CandleDB(tf, path, read_only=args.dry_run) as db:
+        control = jobcontrol.JobControl.from_env()
+        try:
+            insts = select_instruments(db, symbols=csv_list(args.symbols),
+                                       security_ids=[int(x) for x in csv_list(args.security_ids) or []] or None,
+                                       select_all=args.all, limit=args.limit)
+        except SystemExit:
+            raise
+        if mode == live.CURRENT:
+            mapped = [i for i in insts if adapter.map_instrument(i) is not None]
+            popts = live.PollOptions(provider=prov, poll_seconds=args.poll_seconds, until_close=not args.once,
+                                     max_cycles=args.max_cycles, wait_for_open=not args.no_wait_for_open,
+                                     intraday_date_format=settings.intraday_date_format, client_id=settings.client_id)
+            per_cycle = len(mapped)
+            sessions = int(((live.CLOSE_GRACE_MINUTES + 375) * 60) / max(args.poll_seconds, 1)) + 1
+            print(f"current-session polling of {tf.name} via {adapter.label}: {per_cycle} instrument(s), every {args.poll_seconds}s; "
+                  f"about {per_cycle:,} request(s) per cycle and up to {per_cycle * sessions:,} in a full session. "
+                  "Provisional bars only: the canonical candles stay final-only.")
+            if args.dry_run:
+                print(usage_line(settings, planned=per_cycle, provider=prov))
+                return 0
+            popts.poll_seconds = args.poll_seconds
+            client = make_client(settings, tf.name, max_attempts=args.max_attempts, provider=prov)
+            stats = live.poll_current(db, client, adapter, mapped, popts, control=control)
+            print(f"\npoll {stats['status']}: cycles {stats['cycles']}, instruments polled {stats['polled']}, "
+                  f"failed {stats['failed']}, provisional bars stored {stats['bars']}")
+            if stats["note"]:
+                print(f"note: {stats['note']}")
+            print(client.budget.summary())
+            return EXIT_CODES.get(stats["status"], 3)
+        uopts = live.UpdateOptions(provider=prov, overlap_days=args.overlap_days, seed_days=args.seed_days,
+                                   finalize_after_hour=args.finalize_after_hour, retry_failed=args.retry_failed,
+                                   min_interval_minutes=args.min_interval_minutes,
+                                   intraday_date_format=settings.intraday_date_format, client_id=settings.client_id)
+        plan = live.plan_update(db, adapter, insts, uopts)
+        s = plan.summary()
+        print(f"update {tf.name} via {adapter.label}: final day boundary {plan.cutoff:%Y-%m-%d} (exclusive); to update {s['to_update']}, "
+              f"already current {s['up_to_date']}, updated moments ago {s['recently_updated']}, need backfill {s['needs_backfill']}, "
+              f"no {adapter.label} identifier {s['unmapped']}, skipped as failing {s['skipped_failing']}; {s['requests']:,} request(s)")
+        for note in plan.notes:
+            print(f"note: {note}")
+        if args.dry_run:
+            print(usage_line(settings, planned=plan.requests, provider=prov))
+            return 0
+        if not plan.to_update:
+            print("nothing to request.")
+            return 0
+        client = make_client(settings, tf.name, max_attempts=args.max_attempts, provider=prov)
+        stats = live.run_update(db, client, adapter, plan, uopts, control=control)
+        done = {k: v for k, v in stats.items() if k not in ("results", "instruments", "note", "plan")}
+        print(f"\nupdate {stats['status']}: {done}")
+        if stats["note"]:
+            print(f"note: {stats['note']}")
+        print(client.budget.summary())
+        if db.outstanding_failures():
+            print("failed/retriable window(s) are outstanding; run the update again, or add --retry-failed for instruments skipped as failing.")
+        return EXIT_CODES.get(stats["status"], 3)
+
+
 # ------------------------------------------------------------------- refresh
 def cmd_refresh(args, settings: Settings) -> int:
     tf = get_timeframe(args.timeframe)
     if args.rps:
-        settings = dataclasses.replace(settings, rps=args.rps)
+        settings = dataclasses.replace(settings, rps=args.rps, rps_override=args.rps)
+    prov = provider_name(settings, args)
+    adapter = get_provider(prov)
+    if not adapter.supports(tf):
+        raise SystemExit(f"{adapter.label} does not provide {tf.name} candles")
     settings = apply_limit_args(settings, args)
     path = db_path(settings, tf)
     if not path.exists():
@@ -223,27 +329,38 @@ def cmd_refresh(args, settings: Settings) -> int:
             raise SystemExit(f"--end-date {args.end_date} is later than the last final day boundary {cutoff:%Y-%m-%d} (exclusive)")
         if start >= end:
             raise SystemExit("--start-date must be before the (exclusive) end date")
-        window_days = args.window_days or tf.default_window_days
+        window_days = args.window_days or adapter.window_days(tf)
         if tf.max_window_days and window_days > tf.max_window_days:
             raise SystemExit(f"--window-days {window_days} exceeds the {tf.max_window_days}-day cap")
+        cap = adapter.capabilities().timeframes[tf.name].max_window_days
+        if cap and window_days > cap:
+            raise SystemExit(f"--window-days {window_days} exceeds {adapter.label}'s {cap}-day cap for {tf.name} candles")
+        first = adapter.earliest(tf)
+        if first is not None and start < to_midnight(first):
+            raise SystemExit(f"--start-date {args.start_date} is before {adapter.label}'s first {tf.name} date ({first}); "
+                             "choose a later start, or refresh that part from a provider that serves it")
+        unmapped = [i.symbol for i in insts if adapter.map_instrument(i) is None]
+        if unmapped:
+            raise SystemExit(f"{adapter.label} has no identifier for: {', '.join(unmapped)}")
         opts = RefreshOptions(start=start, end=end, window_days=window_days, prune_missing=args.prune_missing,
                               retry_failed=args.retry_failed, intraday_date_format=settings.intraday_date_format,
-                              client_id=settings.client_id)
-        print(f"refresh {tf.name}: {', '.join(i.symbol for i in insts)}; range [{start:%Y-%m-%d}, {end:%Y-%m-%d}) exclusive end, "
+                              client_id=settings.client_id, provider=prov, allow_cross_provider=args.allow_cross_provider,
+                              fill_only=args.fill_only)
+        print(f"refresh {tf.name} via {adapter.label}: {', '.join(i.symbol for i in insts)}; range [{start:%Y-%m-%d}, {end:%Y-%m-%d}) exclusive end, "
               f"windows of <= {window_days} days, {settings.rps:g} req/s; "
               f"{'stored candles absent from Dhan will be ARCHIVED then DELETED (--prune-missing)' if args.prune_missing else 'stored candles absent from Dhan are kept'}")
         print("data is stored exactly as received: no corporate-action factor is applied; independent split/bonus validation stays pending")
         if args.dry_run:
             total = 0
             for inst in insts:
-                job, todo = Refresher(db, None).plan(inst, opts)
+                job, todo = Refresher(db, None, provider=adapter).plan(inst, opts)
                 total += len(todo)
                 print(f"  {inst.symbol}: {'resume open job %d' % job if job else 'new job'}, {len(todo)} request(s)")
             print(f"dry run: {total:,} request(s); nothing sent, nothing changed.")
-            print(usage_line(settings, planned=total))
+            print(usage_line(settings, planned=total, provider=prov))
             return 0
-        client = make_client(settings, tf.name, max_attempts=args.max_attempts)
-        stats = Refresher(db, client).run(insts, opts, command=f"refresh {tf.name}")
+        client = make_client(settings, tf.name, max_attempts=args.max_attempts, provider=prov)
+        stats = Refresher(db, client, provider=adapter).run(insts, opts, command=f"refresh {tf.name} --provider {prov}")
         for r in stats["results"]:
             print(f"  {r.symbol}: job {r.job_id}{' (resumed)' if r.resumed else ''} windows {dict(r.windows)}; "
                   f"changed {r.changed}, added {r.added}, absent-from-Dhan {r.missing}, removed {r.removed}")
@@ -291,9 +408,9 @@ def cmd_status(args, settings: Settings) -> int:
 def cmd_usage(args, settings: Settings) -> int:
     """Today's request usage and recent days from the shared ledger (this application only)."""
     path = settings.request_ledger_path
-    today = read_usage(path)
     print(f"ledger: {path}{'' if path.exists() else ' (not created yet)'}")
-    print(usage_line(settings))
+    for name in PROVIDER_NAMES:
+        print(usage_line(settings, provider=name))
     for day, n in (read_usage(path, history=7) or []):
         print(f"  {day}: {n:,}")
     print(COUNTER_CAVEAT)
@@ -324,6 +441,11 @@ def add_limit_args(p: argparse.ArgumentParser) -> None:
     g.add_argument("--max-requests-per-day", type=int,
                    help="stop safely at this many attempts per IST day across all runs/processes/timeframes "
                         "(default STOCKDATA_MAX_REQUESTS_PER_DAY or 80,000; may not exceed Dhan's 100,000)")
+
+
+def add_provider_arg(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--provider", choices=list(PROVIDER_NAMES),
+                   help="data provider for this run (default STOCKDATA_PROVIDER or dhan); every provider writes into the same databases")
 
 
 def add_master_args(p: argparse.ArgumentParser) -> None:
@@ -366,8 +488,39 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--retry-failed", action="store_true", help="also retry permanently failed windows")
     p.add_argument("--empty-error-codes", help="API error codes to record as 'empty' (only after verify-api)")
     p.add_argument("--dry-run", action="store_true", help="print the request plan; send nothing")
+    p.add_argument("--fill-provider-gaps", action="store_true",
+                   help="also request ranges another provider recorded as EMPTY (it having nothing proves nothing about this one)")
+    add_provider_arg(p)
     add_limit_args(p)
     p.set_defaults(func=cmd_download)
+
+    p = sub.add_parser("update", help="bring stored candles up to date from each instrument's last candle (never a history "
+                                      "download); or poll today's completed 15-minute bars into the provisional table")
+    p.add_argument("timeframe", choices=list(TIMEFRAMES))
+    sel = p.add_argument_group("selection (one is required)")
+    sel.add_argument("--symbols", help="comma list, e.g. RELIANCE,TCS")
+    sel.add_argument("--security-ids", help="comma list of security ids")
+    sel.add_argument("--all", action="store_true", help="the whole loaded universe (an update only extends existing data)")
+    sel.add_argument("--limit", type=int, help="only the first N selected instruments")
+    p.add_argument("--mode", choices=["post-close", "current"], default="post-close",
+                   help="post-close: final candles up to the last final day; current: poll today's completed bars (provisional)")
+    p.add_argument("--overlap-days", type=int, default=config.DEFAULT_OVERLAP_DAYS,
+                   help="re-request this many days before the last covered day to detect late revisions")
+    p.add_argument("--seed-days", type=int, help="give an instrument with no stored candles this many recent days "
+                                                 "(without it such instruments are reported as needing a backfill)")
+    p.add_argument("--finalize-after-hour", type=int, default=config.FINALIZE_AFTER_HOUR_IST,
+                   help="IST hour after which today's candles are treated as final (default %(default)s)")
+    p.add_argument("--retry-failed", action="store_true", help="also retry instruments that failed several updates in a row")
+    p.add_argument("--min-interval-minutes", type=int, default=0, help="skip instruments updated successfully this recently")
+    p.add_argument("--poll-seconds", type=int, default=300, help="current mode: seconds between polls (minimum 60)")
+    p.add_argument("--max-cycles", type=int, help="current mode: stop after this many polls")
+    p.add_argument("--once", action="store_true", help="current mode: one poll, not a loop until the close")
+    p.add_argument("--no-wait-for-open", action="store_true", help="current mode: do not wait for 09:15 IST")
+    p.add_argument("--rps", type=float), p.add_argument("--max-attempts", type=int, default=5)
+    p.add_argument("--dry-run", action="store_true", help="show the plan; send nothing")
+    add_provider_arg(p)
+    add_limit_args(p)
+    p.set_defaults(func=cmd_update)
 
     p = sub.add_parser("refresh", help="replace stored candles for chosen symbols and a date range with Dhan's current data "
                                        "(validated first, atomic per window, audited, resumable)")
@@ -384,6 +537,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rps", type=float, help="requests per second (default STOCKDATA_RPS or 3)")
     p.add_argument("--max-attempts", type=int, default=5)
     p.add_argument("--dry-run", action="store_true", help="show the plan; send nothing, change nothing")
+    p.add_argument("--fill-only", action="store_true",
+                   help="only ADD candles that are missing; stored candles are never replaced (differences are recorded as disagreements)")
+    p.add_argument("--allow-cross-provider", action="store_true",
+                   help="allow replacing candles that were stored from a DIFFERENT provider (refused by default)")
+    add_provider_arg(p)
     add_limit_args(p)
     p.set_defaults(func=cmd_refresh)
 

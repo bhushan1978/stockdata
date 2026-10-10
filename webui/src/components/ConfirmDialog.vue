@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
-const props = defineProps<{ open: boolean; title: string; confirmLabel?: string; danger?: boolean; check?: string; busy?: boolean }>()
+const props = defineProps<{ open: boolean; title: string; confirmLabel?: string; danger?: boolean; check?: string; busy?: boolean; disabled?: boolean }>()
 const emit = defineEmits<{ confirm: []; cancel: [] }>()
 const ticked = ref(false)
 watch(() => props.open, (o) => { if (o) ticked.value = false })
@@ -13,7 +13,7 @@ watch(() => props.open, (o) => { if (o) ticked.value = false })
       <label v-if="check" class="inline" style="margin-bottom:12px"><input type="checkbox" v-model="ticked" /> {{ check }}</label>
       <div class="btnrow row end">
         <button @click="emit('cancel')">Cancel</button>
-        <button :class="danger ? 'danger' : 'primary'" :disabled="(!!check && !ticked) || busy" @click="emit('confirm')">{{ busy ? 'Working…' : confirmLabel ?? 'Confirm' }}</button>
+        <button :class="danger ? 'danger' : 'primary'" :disabled="(!!check && !ticked) || busy || disabled" @click="emit('confirm')">{{ busy ? 'Working…' : confirmLabel ?? 'Confirm' }}</button>
       </div>
     </div>
   </div>

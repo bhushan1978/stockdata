@@ -71,6 +71,42 @@ Adjusted value for a candle dated *d* = raw × product of the factors of applied
 (the ex-date candle itself and everything after are untouched). The same rule, the same events and the same code are used for
 both databases, so daily and 15-minute adjusted series stay comparable.
 
+## The ledger, the versioned adjusted view and the interface
+
+Everything below is additive to the principles above; it changes none of them.
+
+* **Auditable ledger.** Each event keeps its instrument, type, announcement/ex/record dates, ratio terms, the **source**, the
+  source reference and URL, **when it was retrieved**, the evidence text, the verification status and note, the computed factor
+  and its origin, the application status and affected range, and a **record version**. Every change (import, evaluation, manual
+  decision, application, withdrawal) adds a row to `corporate_action_revisions` naming who or what changed it, old and new
+  value and a note; re-importing the same event changes nothing.
+* **Versioned, idempotent application.** `corp-actions apply` records each adjusted-view *version* in `adjustment_runs`
+  (with the exact event ids). The version advances **only when the set of applied events or a factor changed**, so repeating
+  `apply` is a no-op and nothing that depends on the adjusted series (an export, a cache, a backtest) needs recomputing for
+  nothing. A consumer can read the version and the database fingerprint to know whether an adjusted series changed. The view is
+  rebuilt atomically; raw candles are never touched.
+* **Validation.** After a change, price continuity and volume scaling around every applied event are checked on the *adjusted*
+  view (`adjustment_validations`): the adjusted open/previous-close ratio must lie in 0.80-1.25 and the adjusted volume ratio in
+  0.25-4. A failure does not undo the adjustment; it is stored and shown for review (a person-confirmed wrong factor, or raw
+  history that was already adjusted, is caught this way).
+* **Chronological multi-event, same rules for both databases.** A candle dated *d* is multiplied by the product of the factors of
+  events with `ex_date > d`, in date order, for daily and 15-minute alike.
+* **Providers.** If candles around an ex-date came from more than one provider the event is **not** verified automatically
+  (their adjustment bases may differ); it is held as unresolved for a person.
+* **No look-ahead.** The adjusted series can be asked for "as known on" a date (`as_of`): only events whose ex-date is on or
+  before it are applied (`stockdata.corp_actions.verified_events(con, ..., as_of=...)` and `adjust_frame(...)`), which is what a
+  backtest standing on that day could know.
+* **Dividends** are recorded (`recorded_not_adjusted`) and never enter the series. **Nothing is inferred from a price gap**:
+  *Scan for unrecorded gaps* lists leads only, and an event whose source is not confirmed stays `proposed` and adjusts nothing.
+* **Sources.** Events enter only from a file or an entry you provide from an official record (NSE/BSE announcements, the company's
+  filing). The application never scrapes an unofficial site and downloads nothing for this.
+
+In the interface (**Corporate Actions**): record an event or import an official CSV (events start as *proposed*), **1 · Verify
+against candles**, record a person's decision with a mandatory note, **2 · Build adjusted view**; every step is confirmed and
+audited, and changes wait while a download owns the database. In the **Data Explorer**, **Raw** and **Adjusted** are separate
+views, each labelled on the chart legend, in the banner under the chart, in the table and in every CSV export row; ex-dates are
+marked on the chart (purple = used in the adjusted series, grey = recorded only). Raw candles stay raw.
+
 ## Procedure to run (needs network access + token)
 
 1. **Get official records.** Download NSE corporate actions (NSE website → Corporate Filings → Corporate Actions, or the
@@ -120,5 +156,10 @@ classification of raw / already-adjusted / ambiguous histories, no double adjust
 adjusted rows = raw rows (no duplicates or synthetic bars), only dates before the ex-date change, other instruments
 untouched, continuity across the ex-date, idempotent `apply`, daily and 15-minute adjusted closes/volumes agree, and
 that dividends never enter the series.
+
+The ledger revisions, versioned/idempotent application, validations, as-of series, provider-mixing hold and the migration of an
+older database are covered by `tests/test_corp_ledger.py`; the interface path (ledger → labelled adjusted series → raw unchanged,
+as-of, labelled export, unconfirmed source never adjusts, double adjustment refused, dividends, decisions, locking) by
+`tests/test_web_corporate.py`.
 
 **Not done:** comparison with real Dhan candles and real NSE records for any split or bonus.

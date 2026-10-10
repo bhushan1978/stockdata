@@ -43,7 +43,9 @@ SCHEMA = [
         source VARCHAR NOT NULL, source_ref VARCHAR, source_confirmed BOOLEAN NOT NULL,
         verification_status VARCHAR NOT NULL, verification_note VARCHAR,
         apply_adjustment BOOLEAN NOT NULL DEFAULT false,
-        imported_at_utc TIMESTAMP NOT NULL, processed_at_utc TIMESTAMP)""",
+        imported_at_utc TIMESTAMP NOT NULL, processed_at_utc TIMESTAMP,
+        source_url VARCHAR, evidence VARCHAR, retrieved_at_utc TIMESTAMP, version INTEGER DEFAULT 1,
+        affected_from DATE, affected_to DATE, application_status VARCHAR, applied_version INTEGER)""",
     """CREATE TABLE IF NOT EXISTS corporate_action_checks (
         action_id VARCHAR PRIMARY KEY, checked_at_utc TIMESTAMP NOT NULL,
         prev_session DATE, ex_session DATE,
@@ -58,12 +60,27 @@ SCHEMA = [
         cum_price_factor DOUBLE NOT NULL, cum_volume_factor DOUBLE NOT NULL,
         n_events INTEGER NOT NULL, built_at_utc TIMESTAMP NOT NULL,
         PRIMARY KEY (exchange_segment, security_id, valid_from))""",
+    """CREATE TABLE IF NOT EXISTS corporate_action_revisions (
+        revision_id BIGINT PRIMARY KEY, action_id VARCHAR NOT NULL, version INTEGER NOT NULL, changed_at_utc TIMESTAMP NOT NULL,
+        actor VARCHAR, change VARCHAR NOT NULL, old_value VARCHAR, new_value VARCHAR, note VARCHAR)""",
+    """CREATE TABLE IF NOT EXISTS adjustment_runs (
+        version INTEGER PRIMARY KEY, applied_at_utc TIMESTAMP NOT NULL, events_applied INTEGER NOT NULL, segments INTEGER NOT NULL,
+        fingerprint VARCHAR NOT NULL, event_ids VARCHAR, validation_failures INTEGER NOT NULL DEFAULT 0)""",
+    """CREATE TABLE IF NOT EXISTS adjustment_validations (
+        version INTEGER NOT NULL, action_id VARCHAR NOT NULL, checked_at_utc TIMESTAMP NOT NULL, ok BOOLEAN NOT NULL,
+        prev_session DATE, ex_session DATE, adj_prev_close DOUBLE, ex_open DOUBLE, gap_ratio DOUBLE, adj_volume_ratio DOUBLE,
+        detail VARCHAR, PRIMARY KEY (version, action_id))""",
     """CREATE TABLE IF NOT EXISTS adjustment_scan_findings (
         exchange_segment VARCHAR NOT NULL, security_id BIGINT NOT NULL, event_date DATE NOT NULL,
         prev_close DOUBLE, next_open DOUBLE, ratio DOUBLE, volume_ratio DOUBLE,
         nearest_ratio VARCHAR, matched_action_id VARCHAR, found_at_utc TIMESTAMP NOT NULL,
         PRIMARY KEY (exchange_segment, security_id, event_date))""",
 ]
+
+ADDITIVE_COLUMNS = [("corporate_actions", "source_url", "VARCHAR"), ("corporate_actions", "evidence", "VARCHAR"),
+                    ("corporate_actions", "retrieved_at_utc", "TIMESTAMP"), ("corporate_actions", "version", "INTEGER DEFAULT 1"),
+                    ("corporate_actions", "affected_from", "DATE"), ("corporate_actions", "affected_to", "DATE"),
+                    ("corporate_actions", "application_status", "VARCHAR"), ("corporate_actions", "applied_version", "INTEGER")]
 
 EVENT_TYPES = ("SPLIT", "BONUS", "RIGHTS", "DIVIDEND", "MERGER", "DEMERGER", "SYMBOL_CHANGE", "OTHER")
 AUTO_FACTOR = {"SPLIT", "BONUS"}                      # computed from published ratios
@@ -143,6 +160,27 @@ def parse_nse_purpose(purpose: str, face_value: float | None = None) -> dict:
         elif pct and face_value:
             out["cash_amount"] = float(pct.group(1)) / 100 * face_value
     return out
+
+
+# ---------------------------------------------------------------------------------------- revisions
+def _next(con, table: str, column: str) -> int:
+    return con.execute(f"SELECT coalesce(max({column}), 0) + 1 FROM {table}").fetchone()[0]
+
+
+def revise(con, action_id_: str, change: str, old, new, *, actor: str = "system", note: str | None = None, bump: bool = True) -> int:
+    """Append one revision record and (by default) bump the event's version. Returns the new version.
+
+    Nothing about an event is ever overwritten without a trace: the ledger row carries the CURRENT state and this table
+    carries every earlier one (what changed, from what, to what, by whom)."""
+    row = con.execute("SELECT coalesce(version, 1) FROM corporate_actions WHERE action_id = ?", [action_id_]).fetchone()
+    version = (row[0] if row else 1) + (1 if bump and change != "created" else 0)
+    if bump and change != "created":
+        con.execute("UPDATE corporate_actions SET version = ? WHERE action_id = ?", [version, action_id_])
+    con.execute("INSERT INTO corporate_action_revisions (revision_id, action_id, version, changed_at_utc, actor, change, old_value, new_value, note) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [_next(con, "corporate_action_revisions", "revision_id"), action_id_, version, utcnow(), actor, change,
+                 None if old is None else str(old), None if new is None else str(new), note])
+    return version
 
 
 # ------------------------------------------------------------------------------- import
@@ -229,13 +267,20 @@ def import_actions(con, rows: list[dict], *, source: str, source_ref: str, sourc
         if con.execute("SELECT 1 FROM corporate_actions WHERE action_id = ?", [aid]).fetchone():
             res.existing += 1
             continue
-        con.execute(f"INSERT INTO corporate_actions VALUES ({', '.join(['?'] * 31)})",
+        con.execute("""INSERT INTO corporate_actions (action_id, exchange_segment, security_id, symbol, isin, event_type,
+                announcement_date, ex_date, record_date, ratio_text, old_face_value, new_face_value, bonus_new, bonus_held,
+                rights_new, rights_held, issue_price, cash_amount, related_security_id, price_factor, volume_factor, adjusts_price,
+                factor_origin, source, source_ref, source_confirmed, verification_status, verification_note, apply_adjustment,
+                imported_at_utc, processed_at_utc, source_url, evidence, retrieved_at_utc, version, application_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'not_applied')""",
                     [aid, seg, sec, symbol, (str(r.get("isin") or "") or None), etype,
                      _date(r.get("announcement_date")), ex, _date(r.get("record_date")), ratio_text,
                      f["old_face_value"], f["new_face_value"], f["bonus_new"], f["bonus_held"],
                      f["rights_new"], f["rights_held"], f["issue_price"], f["cash_amount"], None,
                      pf, vf, adjusts, origin, source, source_ref or str(r.get("source_ref") or ""),
-                     bool(source_confirmed), status, note or None, False, now, None])
+                     bool(source_confirmed), status, note or None, False, now, None,
+                     str(r.get("source_url") or "") or None, str(r.get("evidence") or "") or None, now])
+        revise(con, aid, "created", None, status, actor="import", note=f"{source}: {source_ref or r.get('source_ref') or ''}".strip(": "), bump=False)
         res.inserted += 1
         res.by_status[status] = res.by_status.get(status, 0) + 1
     return res
@@ -342,15 +387,24 @@ def evaluate_event(sessions: pd.DataFrame, ex_date: date, factor: float, vol_fac
             "ref_ratio": ref_ratio, "basis": basis, "detail": reason}
 
 
+def providers_around(con, tf, exchange_segment: str, security_id: int, ex_date: date, days: int = 25) -> list[str]:
+    """The data providers that supplied this instrument's candles near the ex-date (NULL = recorded before provider tracking = Dhan)."""
+    lo, hi = ex_date - timedelta(days=days), ex_date + timedelta(days=days)
+    key = f"CAST({tf.key_col} AS DATE)" if tf.is_intraday else tf.key_col
+    return sorted(r[0] for r in con.execute(
+        f"SELECT DISTINCT coalesce(provider, 'dhan') FROM {tf.table} WHERE exchange_segment = ? AND security_id = ? AND {key} BETWEEN ? AND ?",
+        [exchange_segment, security_id, lo, hi]).fetchall())
+
+
 def evaluate_all(con, tf, *, reference: dict[tuple[str, date], float] | None = None) -> pd.DataFrame:
     """Check every price-adjusting event against this database's candles and update its status."""
     reference = reference or {}
     now = utcnow()
     events = con.execute("""SELECT action_id, exchange_segment, security_id, symbol, event_type, ex_date,
         price_factor, volume_factor, source_confirmed, verification_status, verification_note, issue_price,
-        rights_new, rights_held FROM corporate_actions WHERE adjusts_price ORDER BY symbol, ex_date""").fetchall()
+        rights_new, rights_held, apply_adjustment FROM corporate_actions WHERE adjusts_price ORDER BY symbol, ex_date""").fetchall()
     rows = []
-    for (aid, seg, sec, sym, etype, ex, pf, vf, confirmed, status, note, issue, r_new, r_held) in events:
+    for (aid, seg, sec, sym, etype, ex, pf, vf, confirmed, status, note, issue, r_new, r_held, was_applied) in events:
         if note and str(note).startswith("manual:"):
             continue                                                  # a human decision is never overwritten
         if sec is None:
@@ -374,6 +428,13 @@ def evaluate_all(con, tf, *, reference: dict[tuple[str, date], float] | None = N
                 ref = reference.get((sym, prev_date)) if prev_date else None
                 if ref:
                     res = evaluate_event(sess, ex, pf, vf, ref)
+                provs = providers_around(con, tf, seg, sec, ex)
+                if len(provs) > 1 and res["basis"] in ("unadjusted", "adjusted"):
+                    # providers can differ in how (and whether) their history is adjusted, so a before/after comparison that
+                    # spans two sources proves nothing about either: a person must look at it
+                    res = {**res, "basis": "ambiguous",
+                           "detail": f"candles around the ex-date come from several providers ({', '.join(provs)}); "
+                                     "their adjustment bases can differ, so this cannot be verified automatically"}
         basis = res["basis"]
         if basis == "unadjusted" and confirmed:
             new_status, apply_, msg = "verified", bool(pf is not None), "candles show the raw jump; source confirmed"
@@ -400,6 +461,9 @@ def evaluate_all(con, tf, *, reference: dict[tuple[str, date], float] | None = N
         con.execute("UPDATE corporate_actions SET verification_status = ?, apply_adjustment = ?, "
                     "verification_note = ?, processed_at_utc = ? WHERE action_id = ?",
                     [new_status, apply_, f"{msg}: {res.get('detail')}", now, aid])
+        if new_status != status or bool(apply_) != bool(was_applied):
+            revise(con, aid, "verification", f"{status}/{'apply' if was_applied else 'hold'}", f"{new_status}/{'apply' if apply_ else 'hold'}",
+                   actor="evaluate", note=res.get("detail"))
         rows.append({"symbol": sym, "type": etype, "ex_date": ex, "factor": pf, "basis": basis,
                      "status": new_status, "applied": apply_, "detail": res.get("detail")})
     return pd.DataFrame(rows)
@@ -416,9 +480,12 @@ def set_manual_status(con, action_id_: str, status: str, note: str) -> None:
     if row is None:
         raise ValueError(f"unknown action_id {action_id_}")
     apply_ = status == "verified" and bool(row[0]) and row[1] is not None
+    before = con.execute("SELECT verification_status, apply_adjustment FROM corporate_actions WHERE action_id = ?", [action_id_]).fetchone()
     con.execute("UPDATE corporate_actions SET verification_status = ?, apply_adjustment = ?, "
                 "verification_note = ?, processed_at_utc = ? WHERE action_id = ?",
                 [status, apply_, f"manual: {note.strip()}", utcnow(), action_id_])
+    revise(con, action_id_, "manual_decision", f"{before[0]}/{'apply' if before[1] else 'hold'}", f"{status}/{'apply' if apply_ else 'hold'}",
+           actor="person", note=note.strip())
 
 
 # ------------------------------------------------------------------ segments and views
@@ -444,12 +511,31 @@ def build_segments(events: list[tuple]) -> list[tuple]:
     return out
 
 
+def _fingerprint(events: list[tuple]) -> str:
+    key = "|".join(f"{e[0]}:{e[1]}:{e[2]}:{e[3]:.12g}:{e[4]:.12g}" for e in sorted(events, key=lambda e: (e[0], e[1], str(e[2]))))
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+def current_version(con) -> int:
+    return con.execute("SELECT coalesce(max(version), 0) FROM adjustment_runs").fetchone()[0]
+
+
 def apply_adjustments(con, tf) -> dict:
-    """Rebuild adjustment_segments from verified events and (re)create the adjusted view."""
-    ev = con.execute("""SELECT exchange_segment, security_id, ex_date, price_factor, volume_factor
+    """Rebuild adjustment_segments from verified events and (re)create the adjusted view, atomically.
+
+    The adjustment VERSION only advances when the set of applied events (or any factor) actually changed, so repeating
+    ``apply`` is a no-op and nothing that depends on the adjusted series (caches, exports, backtests) is invalidated for
+    nothing. Each version is recorded with the exact events behind it. After a change, price continuity and volume scaling
+    around every applied event are validated and the result stored (a failure is a flag for review, never silent)."""
+    ev = con.execute("""SELECT exchange_segment, security_id, ex_date, price_factor, volume_factor, action_id
         FROM corporate_actions WHERE apply_adjustment AND price_factor IS NOT NULL AND security_id IS NOT NULL
-        AND verification_status = 'verified'""").fetchall()
-    segs, now = build_segments([(a, b, c, d, e if e is not None else 1.0) for a, b, c, d, e in ev]), utcnow()
+        AND verification_status = 'verified' ORDER BY ex_date, action_id""").fetchall()
+    events = [(a, b, c, d, e if e is not None else 1.0, f) for a, b, c, d, e, f in ev]
+    segs, now = build_segments([x[:5] for x in events]), utcnow()
+    fp = _fingerprint([x[:5] for x in events])
+    last = con.execute("SELECT version, fingerprint FROM adjustment_runs ORDER BY version DESC LIMIT 1").fetchone()
+    changed = last is None or last[1] != fp
+    version = 1 if last is None else (last[0] + 1 if changed else last[0])
     con.begin()
     try:
         con.execute("DELETE FROM adjustment_segments")
@@ -468,6 +554,22 @@ def apply_adjustments(con, tf) -> dict:
             FROM {tf.table} c LEFT JOIN adjustment_segments s
               ON s.exchange_segment = c.exchange_segment AND s.security_id = c.security_id
              AND {key} >= s.valid_from AND {key} < s.valid_to""")
+        if changed:
+            con.execute("INSERT INTO adjustment_runs (version, applied_at_utc, events_applied, segments, fingerprint, event_ids) VALUES (?, ?, ?, ?, ?, ?)",
+                        [version, now, len(events), len(segs), fp, ",".join(x[5] for x in events)])
+            applied_ids = {x[5] for x in events}
+            for aid, was in con.execute("SELECT action_id, application_status FROM corporate_actions").fetchall():
+                if aid in applied_ids:
+                    first = con.execute(f"SELECT min(CAST({tf.key_col} AS DATE)) FROM {tf.table} c WHERE exchange_segment = "
+                                        "(SELECT exchange_segment FROM corporate_actions WHERE action_id = ?) AND security_id = "
+                                        "(SELECT security_id FROM corporate_actions WHERE action_id = ?)", [aid, aid]).fetchone()[0]
+                    con.execute("UPDATE corporate_actions SET application_status = 'applied', applied_version = ?, affected_from = ?, "
+                                "affected_to = ex_date - INTERVAL 1 DAY WHERE action_id = ?", [version, first, aid])
+                    if was != "applied":
+                        revise(con, aid, "application", was, f"applied in adjustment v{version}", actor="apply")
+                elif was == "applied":
+                    con.execute("UPDATE corporate_actions SET application_status = 'withdrawn', affected_from = NULL, affected_to = NULL WHERE action_id = ?", [aid])
+                    revise(con, aid, "application", was, f"withdrawn in adjustment v{version}", actor="apply")
         con.commit()
     except Exception:
         con.rollback()
@@ -477,7 +579,105 @@ def apply_adjustments(con, tf) -> dict:
                     "events); no dividend or total-return adjustment. Raw data is in the base table.'")
     except Exception:  # comments are cosmetic
         pass
-    return {"events_applied": len(ev), "segments": len(segs)}
+    failures = 0
+    validations: list[dict] = []
+    if events:
+        validations = validate_applied(con, tf, version)
+        failures = sum(1 for v in validations if not v["ok"])
+        if changed:
+            con.execute("UPDATE adjustment_runs SET validation_failures = ? WHERE version = ?", [failures, version])
+    return {"events_applied": len(events), "segments": len(segs), "version": version, "changed": changed,
+            "validation_failures": failures, "validations": validations}
+
+
+GAP_TOLERANCE = (0.80, 1.25)        # an adjusted series should be continuous across the ex-date, within ordinary market moves
+VOLUME_TOLERANCE = (0.25, 4.0)      # adjusted volume should scale across the ex-date: neither unchanged-raw nor vanished
+
+
+def validate_applied(con, tf, version: int) -> list[dict]:
+    """Price continuity and volume scaling around every applied event, on the ADJUSTED view (read-only apart from storing
+    the result). A failed check does not undo the adjustment; it is recorded and shown for review."""
+    out, now = [], utcnow()
+    key = f"CAST({tf.key_col} AS DATE)" if tf.is_intraday else tf.key_col
+    for aid, seg, sec, sym, ex in con.execute("""SELECT action_id, exchange_segment, security_id, symbol, ex_date FROM corporate_actions
+            WHERE application_status = 'applied' AND applied_version = ? ORDER BY ex_date""", [version]).fetchall():
+        sess = con.execute(
+            f"""SELECT {key} AS d, arg_min(open, {tf.key_col}) AS open, arg_max(close, {tf.key_col}) AS close, sum(volume) AS volume
+                FROM {tf.adjusted_view()} WHERE exchange_segment = ? AND security_id = ? AND {key} BETWEEN ? AND ? GROUP BY 1 ORDER BY 1""",
+            [seg, sec, ex - timedelta(days=25), ex + timedelta(days=25)]).df()
+        res = {"action_id": aid, "symbol": sym, "ex_date": ex, "ok": False, "detail": "no candles on both sides of the ex-date: cannot validate",
+               "prev_session": None, "ex_session": None, "adj_prev_close": None, "ex_open": None, "gap_ratio": None, "adj_volume_ratio": None}
+        if len(sess):
+            sess["d"] = pd.to_datetime(sess["d"]).dt.date
+            before, after = sess[sess["d"] < ex], sess[sess["d"] >= ex]
+            if len(before) and len(after) and (after.iloc[0]["d"] - before.iloc[-1]["d"]).days <= MAX_SESSION_GAP_DAYS:
+                prev, first = before.iloc[-1], after.iloc[0]
+                gap = float(first["open"] / prev["close"]) if prev["close"] > 0 else None
+                vb, va = before.tail(5)["volume"].median(), after.head(5)["volume"].median()
+                vr = float(va / vb) if vb and va and vb > 0 and va > 0 else None
+                price_ok = gap is not None and GAP_TOLERANCE[0] <= gap <= GAP_TOLERANCE[1]
+                vol_ok = vr is None or VOLUME_TOLERANCE[0] <= vr <= VOLUME_TOLERANCE[1]
+                res.update(prev_session=prev["d"], ex_session=first["d"], adj_prev_close=float(prev["close"]), ex_open=float(first["open"]),
+                           gap_ratio=gap, adj_volume_ratio=vr, ok=bool(price_ok and vol_ok),
+                           detail=("continuous across the ex-date" if price_ok and vol_ok else
+                                   (f"price gap {gap:.3f} is outside the continuity band {GAP_TOLERANCE}" if not price_ok else "")
+                                   + (f"; " if not price_ok and not vol_ok else "")
+                                   + (f"adjusted volume ratio {vr:.2f} is outside {VOLUME_TOLERANCE}" if not vol_ok else "")))
+        con.execute("""INSERT INTO adjustment_validations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (version, action_id) DO UPDATE SET checked_at_utc = excluded.checked_at_utc, ok = excluded.ok,
+              prev_session = excluded.prev_session, ex_session = excluded.ex_session, adj_prev_close = excluded.adj_prev_close,
+              ex_open = excluded.ex_open, gap_ratio = excluded.gap_ratio, adj_volume_ratio = excluded.adj_volume_ratio, detail = excluded.detail""",
+                    [version, aid, now, res["ok"], res["prev_session"], res["ex_session"], res["adj_prev_close"], res["ex_open"],
+                     res["gap_ratio"], res["adj_volume_ratio"], res["detail"]])
+        out.append(res)
+    return out
+
+
+# ------------------------------------------------------------- adjusted series, with an as-of date (no look-ahead)
+def verified_events(con, exchange_segment: str, security_id: int, *, as_of: date | None = None) -> list[tuple[date, float, float]]:
+    """(ex_date, price_factor, volume_factor) of the VERIFIED, applicable events of one instrument, oldest first.
+    ``as_of`` keeps only events whose ex-date is on or before that date: what a person standing on that day could know."""
+    sql = ("SELECT ex_date, price_factor, coalesce(volume_factor, 1.0) FROM corporate_actions WHERE apply_adjustment "
+           "AND verification_status = 'verified' AND price_factor IS NOT NULL AND exchange_segment = ? AND security_id = ?")
+    args: list = [exchange_segment, security_id]
+    if as_of is not None:
+        sql += " AND ex_date <= ?"
+        args.append(as_of)
+    return [(a, float(b), float(c)) for a, b, c in con.execute(sql + " ORDER BY ex_date", args).fetchall()]
+
+
+def adjust_frame(df: pd.DataFrame, key_col: str, events: list[tuple[date, float, float]]) -> pd.DataFrame:
+    """Apply split/bonus factors to a candle frame (open/high/low/close/volume): a candle dated d is multiplied by the product
+    of the factors of events with ex_date > d, exactly like the stored view. Pure: the input is not modified."""
+    out = df.copy()
+    out["cum_price_factor"], out["cum_volume_factor"] = 1.0, 1.0
+    if not events or out.empty:
+        return out
+    day = pd.to_datetime(out[key_col]).dt.date
+    pf = pd.Series(1.0, index=out.index)
+    vf = pd.Series(1.0, index=out.index)
+    for ex, p, v in events:
+        mask = day < ex
+        pf[mask] *= p
+        vf[mask] *= v
+    for c in ("open", "high", "low", "close"):
+        out[c] = out[c] * pf
+    out["volume"] = out["volume"] * vf
+    out["cum_price_factor"], out["cum_volume_factor"] = pf, vf
+    return out
+
+
+def adjustment_summary(con) -> dict:
+    """The state of the adjusted series in one database, for labels and the interface."""
+    version = current_version(con)
+    run = con.execute("SELECT applied_at_utc, events_applied, validation_failures FROM adjustment_runs WHERE version = ?", [version]).fetchone() if version else None
+    counts = dict(con.execute("SELECT verification_status, count(*) FROM corporate_actions GROUP BY 1").fetchall())
+    return {"version": version, "applied_at_utc": run[0] if run else None, "events_applied": run[1] if run else 0,
+            "validation_failures": run[2] if run else 0, "events_by_status": counts,
+            "unresolved": counts.get("unresolved", 0), "source_adjusted": counts.get("source_adjusted", 0),
+            "proposed": counts.get("proposed", 0), "verified": counts.get("verified", 0),
+            "basis_note": ("Adjusted candles are PRICE-adjusted for verified splits and bonus issues only: no dividend or total-return "
+                           "adjustment, and no event that is unverified, unresolved or already adjusted by the source.")}
 
 
 # ---------------------------------------------------------------------- gap scan

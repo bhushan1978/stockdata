@@ -6,7 +6,7 @@ import Banner from '../components/Banner.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import DataTable from '../components/DataTable.vue'
 import { usePoll } from '../composables'
-import { ago, num, saveText, toCsv } from '../format'
+import { ago, day, duration, num, saveText, toCsv } from '../format'
 import { errText, toast, ui } from '../state'
 import type { Timeframe } from '../types'
 
@@ -17,6 +17,41 @@ const err = ref<{ msg: string; busy: boolean } | null>(null)
 const selected = ref<Set<any>>(new Set())
 const dlg = ref<'' | 'retry' | 'empty'>('')
 const working = ref(false)
+const section = ref<'integrity' | 'coverage' | 'lifecycle'>('integrity')
+const life = ref<any>(null)
+const lifeErr = ref('')
+async function loadLife() {
+  lifeErr.value = ''
+  try { life.value = await api.get('/lifecycle/' + tf.value) } catch (e) { life.value = null; lifeErr.value = errText(e) }
+}
+function pickSection(k: 'integrity' | 'coverage' | 'lifecycle') { section.value = k; if (k === 'lifecycle') void loadLife() }
+// ---- targeted repair of missing sessions (fill gaps: adds candles that are missing, never replaces a stored one)
+const missSel = ref<Set<any>>(new Set())
+const repairAsk = ref(false)
+const repairPlan = ref<any>(null)
+const repairErr = ref('')
+const missRows = computed(() => (rep.value?.reconciliation?.missing_sessions?.rows ?? []).map((r: any) => ({ ...r, last_missing_sessions: r.sample.join(', ') })))
+const missChosen = computed(() => missRows.value.filter((r: any) => missSel.value.has(r.security_id)))
+const repairSpec = computed(() => {
+  const rows = missChosen.value
+  const from = rows.map((r: any) => r.first_missing).sort()[0]
+  const lastMissing = rows.map((r: any) => r.last_missing).sort().slice(-1)[0]
+  if (!rows.length || !from || !lastMissing) return null
+  const end = new Date(lastMissing + 'T00:00:00Z'); end.setUTCDate(end.getUTCDate() + 1)
+  return { kind: 'refresh', refresh_mode: 'fill_gaps', timeframe: tf.value, selection: { mode: 'security_ids', security_ids: rows.map((r: any) => r.security_id) }, start_date: from, end_date: end.toISOString().slice(0, 10) }
+})
+async function openRepair() {
+  repairAsk.value = true; repairPlan.value = null; repairErr.value = ''
+  try { repairPlan.value = await api.post('/plan', repairSpec.value) } catch (e) { repairErr.value = errText(e) }
+}
+async function doRepair() {
+  working.value = true
+  try {
+    const r = await api.post('/jobs', { spec: repairSpec.value, start: 'queue', confirm: true })
+    toast(`Gap-filling job #${r.job.id} queued`, 'ok'); repairAsk.value = false; missSel.value = new Set()
+    void router.push({ path: '/queue', query: { job: r.job.id } })
+  } catch (e) { toast(errText(e), 'error', 9000) } finally { working.value = false }
+}
 const writer = computed(() => ui.overview?.databases?.[tf.value]?.writer_job_id ?? null)
 function exportJson() {
   saveText(`quality_${tf.value}_${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '')}.json`, JSON.stringify(rep.value, null, 2), 'application/json')
@@ -37,7 +72,7 @@ async function run() {
   try { state.value = await api.post(`/quality/${tf.value}/run`); err.value = null } catch (e) { err.value = { msg: errText(e), busy: e instanceof ApiError && e.busy } }
 }
 async function cancel() { try { state.value = await api.post(`/quality/${tf.value}/cancel`) } catch (e) { toast(errText(e), 'error') } }
-function setTf(t: Timeframe) { tf.value = t; state.value = null; selected.value = new Set(); void refresh() }
+function setTf(t: Timeframe) { tf.value = t; state.value = null; selected.value = new Set(); missSel.value = new Set(); life.value = null; void refresh(); if (section.value === 'lifecycle') void loadLife() }
 
 const failRows = computed(() => (rep.value?.outstanding_windows ?? []).map((w: any, i: number) => ({ ...w, key: i })))
 const chosenIds = computed(() => [...new Set(failRows.value.filter((r: any) => selected.value.has(r.key)).map((r: any) => r.security_id as number))])
@@ -52,6 +87,8 @@ async function createRetry(empty: boolean) {
     void router.push({ path: '/queue', query: { job: r.job.id } })
   } catch (e) { toast(errText(e), 'error', 9000) } finally { working.value = false }
 }
+const missCols = [{ key: 'symbol', label: 'Symbol', sortable: true }, { key: 'missing_sessions', label: 'Missing', sortable: true, align: 'right' as const, mono: true }, { key: 'expected_sessions', label: 'Expected', align: 'right' as const, mono: true },
+  { key: 'first_missing', label: 'First missing', mono: true }, { key: 'last_missing', label: 'Last missing', mono: true }, { key: 'last_missing_sessions', label: 'Examples', wrap: true }]
 const failCols = [{ key: 'symbol', label: 'Symbol', sortable: true }, { key: 'security_id', label: 'Security id', mono: true }, { key: 'from', label: 'From', mono: true }, { key: 'to', label: 'To', mono: true },
   { key: 'status', label: 'Status', sortable: true }, { key: 'error_code', label: 'Code', sortable: true, mono: true }, { key: 'attempts', label: 'Attempts', align: 'right' as const, mono: true }, { key: 'message', label: 'Message', wrap: true }]
 </script>
@@ -65,13 +102,92 @@ const failCols = [{ key: 'symbol', label: 'Symbol', sortable: true }, { key: 'se
         <button v-if="state?.running" @click="cancel">Cancel</button>
         <a class="btn" :href="api.url(`/quality/${tf}/coverage.csv`)" title="Per-instrument coverage report as CSV (also saved under data/reports)">Coverage CSV</a></div></div>
 
+    <div class="tabs"><button :class="{ on: section === 'integrity' }" @click="pickSection('integrity')">Integrity &amp; failures</button><button :class="{ on: section === 'coverage' }" @click="pickSection('coverage')">Coverage &amp; reconciliation</button><button :class="{ on: section === 'lifecycle' }" @click="pickSection('lifecycle')">Instrument lifecycle</button></div>
+
     <Banner v-if="err" :kind="err.busy ? 'warn' : 'error'">{{ err.msg }}<template v-if="err.busy"> Showing the last saved report below, if any. <RouterLink to="/queue">Pause the job</RouterLink> to run fresh checks.</template></Banner>
     <Banner v-if="writer" kind="warn">Download job #{{ writer }} is writing the {{ tf === 'daily' ? 'daily' : '15-minute' }} database, so new checks cannot run on it. <RouterLink to="/queue">Pause the job</RouterLink> to scan it; the last saved report is shown below.</Banner>
     <Banner v-if="state?.error" kind="error">The last check run failed: {{ state.error }}</Banner>
     <Banner v-if="state?.running" kind="info">Running the checks on a read-only connection. This can take a few minutes on a large database, and a download for this dataset will wait until it finishes.</Banner>
-    <div v-if="!rep" class="panel empty"><b>No report yet</b>Press “Run checks” to scan this database. It is read-only and sends no requests.</div>
+    <div v-if="!rep && section !== 'lifecycle'" class="panel empty"><b>No report yet</b>Press “Run checks” to scan this database. It is read-only and sends no requests.</div>
 
-    <template v-else>
+    <template v-else-if="rep && section === 'coverage'">
+      <div class="muted small" style="margin-bottom:8px">Report computed {{ ago(state.computed_at) }}<span v-if="state.stale" class="warn"> — the database has changed since; re-run for current results</span>. Everything here is read-only: a missing candle is never filled in or synthesised.</div>
+      <Banner v-if="!rep.reconciliation" kind="warn">This saved report was made before reconciliation existed. Press “Re-run checks”.</Banner>
+      <template v-else>
+        <div class="grid g4">
+          <div class="panel tile"><h2>Missing sessions</h2><div class="big" :class="rep.reconciliation.missing_sessions.missing_total ? 'warn' : 'ok'">{{ num(rep.reconciliation.missing_sessions.missing_total) }}</div><div class="sub">in {{ num(rep.reconciliation.missing_sessions.instruments_with_missing) }} of {{ num(rep.reconciliation.missing_sessions.instruments_with_data) }} instruments</div></div>
+          <div class="panel tile"><h2>Sessions known</h2><div class="big">{{ num(rep.reconciliation.missing_sessions.sessions_known) }}</div><div class="sub">{{ rep.reconciliation.missing_sessions.first_session }} → {{ rep.reconciliation.missing_sessions.last_session }}</div></div>
+          <div class="panel tile"><h2>Behind the latest session</h2><div class="big" :class="rep.reconciliation.stale.instruments_behind ? 'warn' : 'ok'">{{ num(rep.reconciliation.stale.instruments_behind) }}</div><div class="sub">latest session {{ rep.reconciliation.stale.latest_session ?? '-' }}</div></div>
+          <div class="panel tile"><h2>Provider disagreements</h2><div class="big" :class="rep.reconciliation.provider_disagreements.total ? 'warn' : 'ok'">{{ num(rep.reconciliation.provider_disagreements.total) }}</div><div class="sub">candles where two providers differ</div></div>
+        </div>
+
+        <div class="panel tight"><h2 style="padding:12px 14px 0">Missing sessions by instrument <span class="muted">(worst {{ missRows.length }})</span></h2>
+          <div class="small muted" style="padding:0 14px 6px">{{ rep.reconciliation.missing_sessions.note }}</div>
+          <div class="row" style="padding:0 14px 8px" v-if="missRows.length"><button class="primary small" :disabled="!missSel.size" @click="openRepair">Fill gaps for selected…</button>
+            <span class="muted small">Queues a targeted repair job that re-requests only the missing range and <b>adds</b> candles that are absent; nothing stored is replaced.</span></div>
+          <DataTable :columns="missCols" :rows="missRows" row-key="security_id" selectable v-model:selected="missSel" max-height="320px" empty="No instrument has a missing session inside its stored range."
+            @row-click="(r: any) => router.push({ path: '/explorer', query: { tf, sid: String(r.security_id) } })" />
+        </div>
+
+        <div class="panel tight" v-if="rep.reconciliation.final_candle"><h2 style="padding:12px 14px 0">Final-candle completeness <span class="muted">({{ num(rep.reconciliation.final_candle.sessions_ending_early) }} of {{ num(rep.reconciliation.final_candle.sessions_checked) }} sessions end early)</span></h2>
+          <div class="small muted" style="padding:0 14px 6px">{{ rep.reconciliation.final_candle.note }}</div>
+          <div class="tablewrap" style="max-height:260px"><table class="t"><thead><tr><th>Symbol</th><th class="right">Sessions ending early</th><th class="right">Sessions with few bars</th><th class="right">Sessions</th><th>Latest</th></tr></thead><tbody>
+            <tr v-for="r in rep.reconciliation.final_candle.rows" :key="r.security_id" class="clickable" @click="router.push({ path: '/explorer', query: { tf, sid: String(r.security_id) } })"><td>{{ r.symbol }}</td><td class="right mono">{{ num(r.sessions_ending_early) }}</td><td class="right mono">{{ num(r.sessions_with_few_bars) }}</td><td class="right mono">{{ num(r.sessions) }}</td><td class="mono">{{ r.latest }}</td></tr>
+            <tr v-if="!rep.reconciliation.final_candle.rows.length"><td colspan="5"><div class="empty">Every checked session ends with its final bar.</div></td></tr></tbody></table></div></div>
+
+        <div class="panel tight"><h2 style="padding:12px 14px 0">Stale instruments <span class="muted">({{ num(rep.reconciliation.stale.instruments_behind) }} behind · {{ num(rep.reconciliation.stale.instruments_current) }} current)</span></h2>
+          <div class="small muted" style="padding:0 14px 6px">Active instruments whose last candle is older than the latest market session. <RouterLink to="/live">Live &amp; Current Updates</RouterLink> brings them up to date (an update never fetches history).</div>
+          <div class="tablewrap" style="max-height:240px"><table class="t"><thead><tr><th>Symbol</th><th>Last candle day</th><th class="right">Sessions behind</th></tr></thead><tbody>
+            <tr v-for="r in rep.reconciliation.stale.rows" :key="r.security_id"><td>{{ r.symbol }}</td><td class="mono">{{ r.last_candle_day }}</td><td class="right mono">{{ r.sessions_behind }}</td></tr>
+            <tr v-if="!rep.reconciliation.stale.rows.length"><td colspan="3"><div class="empty">Every active instrument is current.</div></td></tr></tbody></table></div></div>
+
+        <div class="panel tight"><h2 style="padding:12px 14px 0">Abnormal volume <span class="muted">({{ num(rep.reconciliation.abnormal_volume.total) }} sessions {{ rep.reconciliation.abnormal_volume.threshold }}, since {{ rep.reconciliation.abnormal_volume.since }})</span></h2>
+          <div class="small muted" style="padding:0 14px 6px">{{ rep.reconciliation.abnormal_volume.note }}</div>
+          <div class="tablewrap" style="max-height:240px"><table class="t"><thead><tr><th>Symbol</th><th>Date</th><th class="right">Volume</th><th class="right">20-session median</th><th class="right">× median</th></tr></thead><tbody>
+            <tr v-for="(r, i) in rep.reconciliation.abnormal_volume.rows" :key="i" class="clickable" @click="router.push({ path: '/explorer', query: { tf, sid: String(r.security_id) } })"><td>{{ r.symbol }}</td><td class="mono">{{ r.date }}</td><td class="right mono">{{ num(r.volume) }}</td><td class="right mono">{{ num(Math.round(r.median_20)) }}</td><td class="right mono">{{ r.ratio }}</td></tr>
+            <tr v-if="!rep.reconciliation.abnormal_volume.rows.length"><td colspan="5"><div class="empty">No session stands out.</div></td></tr></tbody></table></div></div>
+
+        <div class="panel"><h2>Provider disagreements</h2>
+          <div class="small muted">{{ rep.reconciliation.provider_disagreements.note }}</div>
+          <table class="t" v-if="rep.reconciliation.provider_disagreements.pairs.length"><thead><tr><th>Stored from</th><th>Other value from</th><th class="right">Candles</th><th class="right">Instruments</th><th>First</th><th>Last</th></tr></thead><tbody>
+            <tr v-for="(p, i) in rep.reconciliation.provider_disagreements.pairs" :key="i"><td>{{ p.stored_provider }}</td><td>{{ p.other_provider }}</td><td class="right mono">{{ num(p.candles) }}</td><td class="right mono">{{ num(p.instruments) }}</td><td class="mono">{{ p.first?.slice(0, 16) }}</td><td class="mono">{{ p.last?.slice(0, 16) }}</td></tr></tbody></table>
+          <div v-else class="empty">No two providers have given different values for the same candle.</div>
+          <div class="small muted" style="margin-top:6px">Same provider, later fetch differed (late revisions): {{ num(rep.reconciliation.provider_disagreements.same_provider_revisions) }} candle(s).</div>
+          <details v-if="rep.reconciliation.provider_disagreements.sample.length" style="margin-top:6px"><summary>Most recent disagreements</summary>
+            <table class="t"><thead><tr><th>Symbol</th><th>Candle</th><th>Stored</th><th class="right">Close</th><th>Other</th><th class="right">Close</th></tr></thead><tbody>
+              <tr v-for="(d, i) in rep.reconciliation.provider_disagreements.sample" :key="i"><td>{{ d.symbol }}</td><td class="mono">{{ d.candle.slice(0, 16) }}</td><td>{{ d.stored_provider }}</td><td class="right mono">{{ d.stored_close }}</td><td>{{ d.other_provider }}</td><td class="right mono">{{ d.other_close }}</td></tr></tbody></table></details>
+        </div>
+      </template>
+    </template>
+
+    <template v-else-if="section === 'lifecycle'">
+      <Banner v-if="lifeErr" kind="warn">{{ lifeErr }}</Banner>
+      <div v-else-if="!life" class="empty">Loading…</div>
+      <template v-else>
+        <Banner kind="info"><ul class="small" style="margin:0 0 0 18px;padding:0"><li v-for="n in life.notes" :key="n">{{ n }}</li></ul></Banner>
+        <div class="grid g2">
+          <div class="panel tight"><h2 style="padding:12px 14px 0">Renamed ({{ life.renamed.length }})</h2>
+            <table class="t"><thead><tr><th>Security id</th><th>Symbols over time</th><th>Latest change</th></tr></thead><tbody><tr v-for="r in life.renamed" :key="r.security_id"><td class="mono">{{ r.security_id }}</td><td>{{ r.symbols.join(' → ') }}</td><td class="mono">{{ r.latest_change }}</td></tr>
+              <tr v-if="!life.renamed.length"><td colspan="3"><div class="empty">No rename recorded{{ life.master_history_since ? ' since ' + life.master_history_since.slice(0, 10) : '' }}.</div></td></tr></tbody></table></div>
+          <div class="panel tight"><h2 style="padding:12px 14px 0">Symbol used by different securities ({{ life.symbol_reused.length }})</h2>
+            <table class="t"><thead><tr><th>Symbol</th><th>Security ids (separate series)</th></tr></thead><tbody><tr v-for="r in life.symbol_reused" :key="r.symbol"><td>{{ r.symbol }}</td><td class="mono">{{ r.security_ids.join(', ') }}</td></tr>
+              <tr v-if="!life.symbol_reused.length"><td colspan="2"><div class="empty">None.</div></td></tr></tbody></table></div>
+          <div class="panel tight"><h2 style="padding:12px 14px 0">One ISIN on several security ids ({{ life.isin_shared.length }})</h2>
+            <table class="t"><thead><tr><th>ISIN</th><th>Security ids</th><th>Symbols</th></tr></thead><tbody><tr v-for="r in life.isin_shared" :key="r.isin"><td class="mono">{{ r.isin }}</td><td class="mono">{{ r.security_ids.join(', ') }}</td><td>{{ r.symbols.join(', ') }}</td></tr>
+              <tr v-if="!life.isin_shared.length"><td colspan="3"><div class="empty">None (ISINs exist only if the detailed instrument master was loaded).</div></td></tr></tbody></table></div>
+          <div class="panel tight"><h2 style="padding:12px 14px 0">New listings, last 30 days ({{ life.new_listings.length }})</h2>
+            <table class="t"><thead><tr><th>Symbol</th><th>Security id</th><th>First seen</th></tr></thead><tbody><tr v-for="r in life.new_listings" :key="r.security_id"><td>{{ r.symbol }}</td><td class="mono">{{ r.security_id }}</td><td class="mono">{{ r.first_seen }}</td></tr>
+              <tr v-if="!life.new_listings.length"><td colspan="3"><div class="empty">None.</div></td></tr></tbody></table></div>
+        </div>
+        <div class="panel tight"><h2 style="padding:12px 14px 0">No longer in the instrument master ({{ life.left_the_master.length }})</h2>
+          <div class="small muted" style="padding:0 14px 6px">Candles stay in the database under their security id. The master has no suspension flag, so “left the master” is the closest signal for a suspension or delisting and needs confirming against the exchange.</div>
+          <table class="t"><thead><tr><th>Symbol</th><th>Security id</th><th>Last seen in master</th><th class="right">Candles</th><th>Last candle</th></tr></thead><tbody>
+            <tr v-for="r in life.left_the_master" :key="r.security_id" class="clickable" @click="router.push({ path: '/explorer', query: { tf, sid: String(r.security_id) } })"><td>{{ r.symbol }}</td><td class="mono">{{ r.security_id }}</td><td class="mono">{{ r.last_seen }}</td><td class="right mono">{{ num(r.candles) }}</td><td class="mono">{{ r.last_candle ?? '-' }}</td></tr>
+            <tr v-if="!life.left_the_master.length"><td colspan="5"><div class="empty">Every instrument that ever had candles is still in the master.</div></td></tr></tbody></table></div>
+      </template>
+    </template>
+
+    <template v-else-if="rep">
       <div class="muted small" style="margin-bottom:8px">Report computed {{ ago(state.computed_at) }}<span v-if="state.stale" class="warn"> — the database has changed since; re-run for current results</span></div>
       <div class="grid g4">
         <div class="panel tile"><h2>Confirmed failures</h2><div class="big" :class="rep.severity_summary.confirmed_failures ? 'down' : 'ok'">{{ rep.severity_summary.confirmed_failures }}</div><div class="sub">failed integrity checks, plus outstanding failed windows</div></div>
@@ -110,6 +226,17 @@ const failCols = [{ key: 'symbol', label: 'Symbol', sortable: true }, { key: 'se
           <template #cell-reasons="{ row }">{{ row.reasons.join(' · ') }}</template></DataTable></div>
     </template>
 
+    <ConfirmDialog :open="repairAsk" title="Fill the missing sessions?" confirm-label="Queue the repair" :busy="working || (!repairPlan && !repairErr)" :disabled="!!repairErr || !!repairPlan?.blockers?.length"
+      :check="repairPlan ? `I understand this will send about ${num(repairPlan.windows)} request(s) to ${repairPlan.provider_label}.` : undefined" @cancel="repairAsk = false" @confirm="doRepair">
+      <div v-if="!repairPlan && !repairErr" class="muted">Working out the request plan…</div>
+      <Banner v-if="repairErr" kind="error">{{ repairErr }}</Banner>
+      <template v-if="repairPlan">
+        <div class="kv small"><span>Instruments</span><span class="mono">{{ num(repairPlan.instruments) }}</span><span>Range</span><span class="mono">{{ repairPlan.resolved_start }} → {{ repairPlan.end_exclusive }} (exclusive)</span>
+          <span>Requests</span><span class="mono">{{ num(repairPlan.windows) }} · ≈ {{ duration(repairPlan.estimated_seconds) }}</span><span>Provider</span><span>{{ repairPlan.provider_label }}</span></div>
+        <Banner v-for="(w, i) in repairPlan.warnings.filter((x: any) => x.level !== 'info')" :key="i" :kind="w.level === 'blocker' ? 'error' : 'warn'">{{ w.message }}</Banner>
+      </template>
+      <div class="small muted" style="margin-top:6px">Fill-gaps mode: candles that are absent are added; every stored candle is kept (a differing value is recorded as a disagreement). The range is the union of the selected instruments' missing sessions, so already-complete dates inside it are re-requested but not changed.</div>
+    </ConfirmDialog>
     <ConfirmDialog :open="dlg === 'retry'" title="Retry the selected instruments?" confirm-label="Queue retry job" check="I understand this spends API requests" :busy="working" @cancel="dlg = ''" @confirm="createRetry(false)">
       A new job retries failed windows for {{ chosenIds.length }} instrument(s) using the engine's retry option. Completed windows are not requested again.</ConfirmDialog>
     <ConfirmDialog :open="dlg === 'empty'" title="Record DH-907 as an empty range?" danger confirm-label="Record as empty" check="I have reviewed these instruments and they genuinely have no data" :busy="working" @cancel="dlg = ''" @confirm="createRetry(true)">

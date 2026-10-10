@@ -19,7 +19,7 @@ from stockdata.timeframes import Timeframe
 from stockdata.timeutil import ist_now, utcnow
 from stockdata.windows import Window
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"      # 2: provider provenance columns (additive; see _migrate)
 STATUSES = ("complete", "empty", "failed", "retriable")
 CANDLE_COLS = ("open", "high", "low", "close", "volume", "epoch_raw")
 
@@ -57,6 +57,7 @@ def _ddl(tf: Timeframe) -> list[str]:
             epoch_raw BIGINT NOT NULL,
             window_id BIGINT NOT NULL,
             ingested_at_utc TIMESTAMP NOT NULL,
+            provider VARCHAR,
             PRIMARY KEY (exchange_segment, security_id, {tf.key_col}))""",
         "CREATE SEQUENCE IF NOT EXISTS window_id_seq START 1",
         """CREATE TABLE IF NOT EXISTS download_windows (
@@ -68,7 +69,7 @@ def _ddl(tf: Timeframe) -> list[str]:
             rows_flagged INTEGER, rows_revised INTEGER, zero_volume_rows INTEGER,
             http_status INTEGER, error_code VARCHAR, error_message VARCHAR,
             first_attempt_at_utc TIMESTAMP NOT NULL, last_attempt_at_utc TIMESTAMP NOT NULL,
-            completed_at_utc TIMESTAMP,
+            completed_at_utc TIMESTAMP, provider VARCHAR,
             UNIQUE (exchange_segment, security_id, window_from, window_to))""",
         "CREATE SEQUENCE IF NOT EXISTS run_id_seq START 1",
         """CREATE TABLE IF NOT EXISTS download_runs (
@@ -86,6 +87,7 @@ def _ddl(tf: Timeframe) -> list[str]:
             old_open DOUBLE, old_high DOUBLE, old_low DOUBLE, old_close DOUBLE, old_volume BIGINT,
             new_open DOUBLE, new_high DOUBLE, new_low DOUBLE, new_close DOUBLE, new_volume BIGINT,
             window_id BIGINT NOT NULL, detected_at_utc TIMESTAMP NOT NULL,
+            old_provider VARCHAR, new_provider VARCHAR,
             PRIMARY KEY (exchange_segment, security_id, candle_key,
                          new_open, new_high, new_low, new_close, new_volume))""",
         # --- explicit historical refresh (see stockdata/refresh.py): jobs, per-window progress, applied changes
@@ -94,7 +96,7 @@ def _ddl(tf: Timeframe) -> list[str]:
             job_id BIGINT PRIMARY KEY, exchange_segment VARCHAR NOT NULL, security_id BIGINT NOT NULL,
             range_from TIMESTAMP NOT NULL, range_to TIMESTAMP NOT NULL, prune_missing BOOLEAN NOT NULL,
             status VARCHAR NOT NULL CHECK (status IN ('open', 'complete')),
-            created_at_utc TIMESTAMP NOT NULL, finished_at_utc TIMESTAMP, command VARCHAR, note VARCHAR)""",
+            created_at_utc TIMESTAMP NOT NULL, finished_at_utc TIMESTAMP, command VARCHAR, note VARCHAR, fill_only BOOLEAN)""",
         """CREATE TABLE IF NOT EXISTS refresh_windows (
             job_id BIGINT NOT NULL, window_from TIMESTAMP NOT NULL, window_to TIMESTAMP NOT NULL,
             status VARCHAR NOT NULL CHECK (status IN
@@ -111,16 +113,46 @@ def _ddl(tf: Timeframe) -> list[str]:
             change_type VARCHAR NOT NULL CHECK (change_type IN ('revised', 'added', 'missing_kept', 'removed')),
             old_open DOUBLE, old_high DOUBLE, old_low DOUBLE, old_close DOUBLE, old_volume BIGINT,
             new_open DOUBLE, new_high DOUBLE, new_low DOUBLE, new_close DOUBLE, new_volume BIGINT,
-            applied_at_utc TIMESTAMP NOT NULL)""",
+            applied_at_utc TIMESTAMP NOT NULL, old_provider VARCHAR, new_provider VARCHAR)""",
         *corp_actions.SCHEMA,
+        # --- live / current updates (stockdata/live.py): per-instrument outcome of the latest update, and the provisional
+        # bars of the session in progress. Provisional bars are NEVER part of the canonical candle table.
+        """CREATE TABLE IF NOT EXISTS update_state (
+            exchange_segment VARCHAR NOT NULL, security_id BIGINT NOT NULL, mode VARCHAR NOT NULL,
+            provider VARCHAR, last_attempt_at_utc TIMESTAMP, last_success_at_utc TIMESTAMP, last_candle_key TIMESTAMP,
+            last_status VARCHAR, last_error VARCHAR, consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (exchange_segment, security_id, mode))""",
+        *([f"""CREATE TABLE IF NOT EXISTS provisional_candles (
+            exchange_segment VARCHAR NOT NULL, security_id BIGINT NOT NULL, {tf.key_col} {key_type} NOT NULL,
+            open DOUBLE NOT NULL, high DOUBLE NOT NULL, low DOUBLE NOT NULL, close DOUBLE NOT NULL, volume BIGINT NOT NULL,
+            epoch_raw BIGINT NOT NULL, provider VARCHAR, fetched_at_utc TIMESTAMP NOT NULL,
+            PRIMARY KEY (exchange_segment, security_id, {tf.key_col}))"""] if tf.is_intraday else []),
     ]
+
+
+# Columns added after the first release. ``provider`` NULL means "recorded before provider tracking", when Dhan was the only
+# source: nothing is rewritten, so an existing database keeps every byte it had and simply gains empty columns.
+def _additive_columns(tf: Timeframe) -> list[tuple[str, str, str]]:
+    return [(tf.table, "provider", "VARCHAR"), ("download_windows", "provider", "VARCHAR"),
+            ("candle_revisions", "old_provider", "VARCHAR"), ("candle_revisions", "new_provider", "VARCHAR"),
+            ("refresh_changes", "old_provider", "VARCHAR"), ("refresh_changes", "new_provider", "VARCHAR"),
+            ("refresh_jobs", "fill_only", "BOOLEAN"), *corp_actions.ADDITIVE_COLUMNS]
+
+
+def _views(tf: Timeframe) -> list[str]:
+    return [f"""CREATE OR REPLACE VIEW provider_disagreements AS
+            SELECT exchange_segment, security_id, candle_key,
+                   coalesce(old_provider, 'dhan') AS stored_provider, coalesce(new_provider, 'dhan') AS other_provider,
+                   old_open, old_high, old_low, old_close, old_volume, new_open, new_high, new_low, new_close, new_volume,
+                   detected_at_utc
+            FROM candle_revisions WHERE coalesce(old_provider, 'dhan') <> coalesce(new_provider, 'dhan')"""]
 
 
 _UPSERT_WINDOW = """
 INSERT INTO download_windows (window_id, exchange_segment, security_id, window_from, window_to,
     status, attempts, rows_received, rows_inserted, rows_flagged, rows_revised, zero_volume_rows,
-    http_status, error_code, error_message, first_attempt_at_utc, last_attempt_at_utc, completed_at_utc)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    http_status, error_code, error_message, first_attempt_at_utc, last_attempt_at_utc, completed_at_utc, provider)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (exchange_segment, security_id, window_from, window_to) DO UPDATE SET
     -- a failed re-fetch must never downgrade a window that is already complete/empty
     status = CASE WHEN excluded.status IN ('failed','retriable')
@@ -141,7 +173,9 @@ ON CONFLICT (exchange_segment, security_id, window_from, window_to) DO UPDATE SE
     error_message = excluded.error_message,
     last_attempt_at_utc = excluded.last_attempt_at_utc,
     completed_at_utc = CASE WHEN excluded.status IN ('complete','empty')
-                            THEN excluded.completed_at_utc ELSE download_windows.completed_at_utc END
+                            THEN excluded.completed_at_utc ELSE download_windows.completed_at_utc END,
+    -- the provider of a window is the one that last COMPLETED it (a failed attempt never changes the credit)
+    provider = CASE WHEN excluded.status IN ('complete','empty') THEN excluded.provider ELSE download_windows.provider END
 """
 
 
@@ -158,6 +192,9 @@ class CandleDB:
             if not read_only:
                 for stmt in _ddl(tf):
                     self.con.execute(stmt)
+                self._migrate()
+                for stmt in _views(tf):
+                    self.con.execute(stmt)
                 self.set_meta("timeframe", tf.name, only_if_missing=True)
                 self.set_meta("schema_version", SCHEMA_VERSION, only_if_missing=True)
         except Exception:
@@ -173,6 +210,20 @@ class CandleDB:
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+    def _migrate(self) -> None:
+        """Add the columns introduced after the first release (idempotent, additive, never rewrites a row)."""
+        have = {(a, b) for a, b in self.con.execute(
+            "SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'main'").fetchall()}
+        added = []
+        for table, column, ddl in _additive_columns(self.tf):
+            if (table, column) not in have:
+                self.con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+                added.append(f"{table}.{column}")
+        if added:
+            self.set_meta("schema_version", SCHEMA_VERSION)
+            self.set_meta("provenance_note", "provider NULL = recorded before provider tracking (Dhan was the only source)")
+            self.set_meta("migrated_" + utcnow().strftime("%Y%m%dT%H%M%S"), "added " + ", ".join(added))
 
     def _check_identity(self) -> None:
         tables = {r[0] for r in self.con.execute(
@@ -285,11 +336,20 @@ class CandleDB:
         return [Instrument(*r) for r in self.con.execute(sql, args).fetchall()]
 
     # -- progress / checkpoints -----------------------------------------------------
-    def covered_intervals(self, inst: Instrument) -> list[tuple[datetime, datetime]]:
-        return [(a, b) for a, b in self.con.execute(
-            """SELECT window_from, window_to FROM download_windows
-               WHERE exchange_segment = ? AND security_id = ? AND status IN ('complete','empty')
-               ORDER BY window_from""", [inst.exchange_segment, inst.security_id]).fetchall()]
+    def covered_intervals(self, inst: Instrument, *, provider: str | None = None,
+                          foreign_empty_is_gap: bool = False) -> list[tuple[datetime, datetime]]:
+        """Ranges already covered by a complete/empty window.
+
+        With ``foreign_empty_is_gap`` an EMPTY window recorded by a different provider does not count as covered: one provider
+        having nothing for a range does not prove another has nothing (the fallback-fill plan uses this). Legacy windows
+        (provider NULL) were all Dhan's."""
+        sql = ("SELECT window_from, window_to FROM download_windows WHERE exchange_segment = ? AND security_id = ? "
+               "AND status IN ('complete','empty')")
+        args: list = [inst.exchange_segment, inst.security_id]
+        if foreign_empty_is_gap and provider:
+            sql += " AND (status = 'complete' OR coalesce(provider, 'dhan') = ?)"
+            args.append(provider)
+        return [(a, b) for a, b in self.con.execute(sql + " ORDER BY window_from", args).fetchall()]
 
     def outstanding_failures(self) -> list[tuple]:
         """failed/retriable windows NOT contained in a later complete/empty window.
@@ -319,16 +379,17 @@ class CandleDB:
         return row[0] if row else self.next_id("download_windows", "window_id")
 
     def _upsert_window(self, wid, inst, w, *, status, attempts, received, inserted, flagged, revised,
-                       zero_volume, http_status, error_code, error_message, now) -> None:
+                       zero_volume, http_status, error_code, error_message, now, provider=None) -> None:
         assert status in STATUSES
         done = now if status in ("complete", "empty") else None
         self.con.execute(_UPSERT_WINDOW, [
             wid, inst.exchange_segment, inst.security_id, w.start, w.end, status, attempts, received,
             inserted, flagged, revised, zero_volume, http_status, error_code, error_message,
-            now, now, done])
+            now, now, done, provider])
 
     def record_failure(self, inst: Instrument, w: Window, *, status: str, attempts: int,
-                       http_status: int | None, error_code: str | None, error_message: str) -> None:
+                       http_status: int | None, error_code: str | None, error_message: str,
+                       provider: str | None = None) -> None:
         assert status in ("failed", "retriable")
         con = self.con
         con.begin()
@@ -336,7 +397,8 @@ class CandleDB:
             wid = self._window_id(inst, w)
             self._upsert_window(wid, inst, w, status=status, attempts=attempts, received=None, inserted=0,
                                 flagged=None, revised=None, zero_volume=None, http_status=http_status,
-                                error_code=error_code, error_message=error_message[:500], now=utcnow())
+                                error_code=error_code, error_message=error_message[:500], now=utcnow(),
+                                provider=provider)
             con.commit()
         except Exception:
             con.rollback()
@@ -345,7 +407,7 @@ class CandleDB:
     def commit_window(self, inst: Instrument, w: Window, *, candles: pd.DataFrame,
                       anomalies: pd.DataFrame, zero_volume: int, attempts: int,
                       http_status: int | None, empty_error_code: str | None = None,
-                      empty_error_message: str | None = None) -> dict:
+                      empty_error_message: str | None = None, provider: str | None = None) -> dict:
         """Insert candles + mark the window complete/empty in ONE transaction.
 
         A window is therefore never marked done unless its data is committed."""
@@ -363,6 +425,7 @@ class CandleDB:
                 stage.insert(0, "exchange_segment", inst.exchange_segment)
                 stage["window_id"] = wid
                 stage["ingested_at_utc"] = pd.Timestamp(now).as_unit("us")
+                stage["provider"] = provider
                 con.register("stage", stage)
                 try:
                     join = (f"c.exchange_segment = s.exchange_segment AND c.security_id = s.security_id "
@@ -374,9 +437,12 @@ class CandleDB:
                         f"SELECT count(*) FROM {tf.table} c JOIN stage s ON {join} WHERE {differs}").fetchone()[0]
                     if revised:  # keep both versions; the stored (first-seen) candle is not overwritten
                         con.execute(f"""INSERT INTO candle_revisions
+                            (exchange_segment, security_id, candle_key, old_open, old_high, old_low, old_close, old_volume,
+                             new_open, new_high, new_low, new_close, new_volume, window_id, detected_at_utc,
+                             old_provider, new_provider)
                             SELECT c.exchange_segment, c.security_id, CAST(c.{k} AS TIMESTAMP),
                                    c.open, c.high, c.low, c.close, c.volume,
-                                   s.open, s.high, s.low, s.close, s.volume, ?, ?
+                                   s.open, s.high, s.low, s.close, s.volume, ?, ?, c.provider, s.provider
                             FROM {tf.table} c JOIN stage s ON {join} WHERE {differs}
                             ON CONFLICT DO NOTHING""", [wid, now])
                     inserted = con.execute(
@@ -385,9 +451,9 @@ class CandleDB:
                             AND c.{k} = {key_expr})""").fetchone()[0]
                     con.execute(f"""INSERT INTO {tf.table}
                         (exchange_segment, security_id, {k}, open, high, low, close, volume, epoch_raw,
-                         window_id, ingested_at_utc)
+                         window_id, ingested_at_utc, provider)
                         SELECT exchange_segment, security_id, {key_expr}, open, high, low, close, volume,
-                               epoch_raw, window_id, ingested_at_utc FROM stage s
+                               epoch_raw, window_id, ingested_at_utc, provider FROM stage s
                         ON CONFLICT DO NOTHING""")
                 finally:
                     con.unregister("stage")
@@ -408,13 +474,63 @@ class CandleDB:
                 wid, inst, w, status="complete" if received else "empty", attempts=attempts,
                 received=received, inserted=inserted, flagged=int(anomalies["candle_key"].nunique()),
                 revised=revised, zero_volume=zero_volume, http_status=http_status,
-                error_code=empty_error_code, error_message=empty_error_message, now=now)
+                error_code=empty_error_code, error_message=empty_error_message, now=now, provider=provider)
             con.commit()
         except Exception:
             con.rollback()
             raise
         return {"received": received, "inserted": inserted, "revised": revised,
                 "flagged": int(anomalies["candle_key"].nunique()), "zero_volume": zero_volume}
+
+    # -- live / current updates -----------------------------------------------------
+    def set_update_state(self, inst: Instrument, *, mode: str, provider: str | None, status: str, error: str | None = None,
+                         last_key=None) -> None:
+        """Outcome of the latest update for one instrument. ``ok`` resets the failure streak; anything else extends it."""
+        now, ok = utcnow(), status in ("ok", "up_to_date")
+        self.con.execute("""INSERT INTO update_state (exchange_segment, security_id, mode, provider, last_attempt_at_utc,
+                last_success_at_utc, last_candle_key, last_status, last_error, consecutive_failures)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (exchange_segment, security_id, mode) DO UPDATE SET provider = excluded.provider,
+              last_attempt_at_utc = excluded.last_attempt_at_utc,
+              last_success_at_utc = CASE WHEN ? THEN excluded.last_attempt_at_utc ELSE update_state.last_success_at_utc END,
+              last_candle_key = coalesce(excluded.last_candle_key, update_state.last_candle_key),
+              last_status = excluded.last_status, last_error = excluded.last_error,
+              consecutive_failures = CASE WHEN ? THEN 0 ELSE update_state.consecutive_failures + 1 END""",
+                          [inst.exchange_segment, inst.security_id, mode, provider, now, now if ok else None, last_key, status,
+                           (error or None) and error[:500], 0 if ok else 1, ok, ok])
+
+    def upsert_provisional(self, inst: Instrument, candles: pd.DataFrame, provider: str) -> int:
+        """Store the COMPLETED bars of the session in progress. Provisional rows may be overwritten by later polls; they are
+        deleted once the final candles are committed. Intraday databases only."""
+        if not self.tf.is_intraday or candles.empty:
+            return 0
+        k = self.tf.key_col
+        stage = candles[[k, "open", "high", "low", "close", "volume", "epoch_raw"]].copy()
+        stage.insert(0, "security_id", inst.security_id)
+        stage.insert(0, "exchange_segment", inst.exchange_segment)
+        stage["provider"], stage["fetched_at_utc"] = provider, pd.Timestamp(utcnow()).as_unit("us")
+        self.con.register("pstage", stage)
+        try:
+            self.con.execute(f"""INSERT OR REPLACE INTO provisional_candles
+                (exchange_segment, security_id, {k}, open, high, low, close, volume, epoch_raw, provider, fetched_at_utc)
+                SELECT exchange_segment, security_id, {k}, open, high, low, close, volume, epoch_raw, provider, fetched_at_utc
+                FROM pstage""")
+        finally:
+            self.con.unregister("pstage")
+        return len(stage)
+
+    def finalize_provisional(self) -> int:
+        """Remove provisional bars whose final candle now exists in the canonical table. Returns how many were removed."""
+        if not self.tf.is_intraday:
+            return 0
+        k = self.tf.key_col
+        n = self.con.execute(f"""SELECT count(*) FROM provisional_candles p WHERE EXISTS (SELECT 1 FROM {self.tf.table} c
+            WHERE c.exchange_segment = p.exchange_segment AND c.security_id = p.security_id AND c.{k} = p.{k})""").fetchone()[0]
+        if n:
+            self.con.execute(f"""DELETE FROM provisional_candles WHERE EXISTS (SELECT 1 FROM {self.tf.table} c
+                WHERE c.exchange_segment = provisional_candles.exchange_segment AND c.security_id = provisional_candles.security_id
+                AND c.{k} = provisional_candles.{k})""")
+        return n
 
     # -- runs ------------------------------------------------------------------
     def start_run(self, command: str) -> int:

@@ -37,10 +37,10 @@ def make_settings(tmp_path: Path, **kw) -> WebSettings:
                        commit="test", **kw)
 
 
-def load_databases(settings: WebSettings) -> None:
+def load_databases(settings: WebSettings, master: str = "master_compact_synthetic.csv") -> None:
     for tf in (DAILY, INTRADAY_15):
         with CandleDB(tf, settings.data_dir / tf.db_name) as db:
-            load_universe(db)
+            load_universe(db, master)
 
 
 def wait_for(predicate, timeout: float = 60.0, interval: float = 0.2, message: str = "condition"):
@@ -57,7 +57,8 @@ class Env:
     """An app + client over a fresh data directory. ``scheduler=False`` lets tests drive ``tick()`` deterministically."""
 
     def __init__(self, tmp_path: Path, *, scheduler: bool = False, databases: bool = True,
-                 token: str | None = "test-token", client_id: str | None = "1000000001"):
+                 token: str | None = "test-token", client_id: str | None = "1000000001",
+                 master: str = "master_compact_synthetic.csv"):
         self.tmp = tmp_path
         self.settings = make_settings(tmp_path)
         if token or client_id:
@@ -68,7 +69,7 @@ class Env:
                 lines.append(f"{CLIENT_KEY}={client_id}")
             self.settings.env_file.write_text("\n".join(lines) + "\n")
         if databases:
-            load_databases(self.settings)
+            load_databases(self.settings, master)
         self.scheduler = scheduler
         self.app = create_app(self.settings, start_scheduler=scheduler)
         self.client = TestClient(self.app, headers=UI)

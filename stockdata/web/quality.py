@@ -9,6 +9,7 @@ from __future__ import annotations
 import threading
 from datetime import datetime, timezone
 
+from stockdata import reconcile
 from stockdata.db import CandleDB
 from stockdata.reports import coverage, integrity_checks
 from stockdata.timeframes import get_timeframe
@@ -131,10 +132,27 @@ def build_report(db: CandleDB) -> dict:
             "integrity": {"failures": failures, "passed": passed},
             "outstanding_windows": out_rows, "outstanding_total": len(outstanding),
             "anomalies": anomalies, "attention": attention[:1000], "attention_total": len(attention),
+            "reconciliation": reconcile.build(db),
             "coverage_columns": list(cov.columns), **extra,
             "severity_summary": {"confirmed_failures": len(failures) + (1 if outstanding else 0),
                                  "warnings": sum(a["count"] for a in anomalies if a["classification"] == "warning"),
                                  "expected": sum(a["count"] for a in anomalies if a["classification"] == "expected")}}
+
+
+def lifecycle_report(data: DataAccess, tf: str) -> dict:
+    """Instrument identity over time (renames, reused symbols, shared ISINs, new listings, instruments that left the master)."""
+    t = get_timeframe(tf)
+    if not data.path(tf).exists():
+        raise DatabaseMissing(f"The {tf} database does not exist yet.")
+    with data.gate.reader(tf):
+        try:
+            with CandleDB(t, data.path(tf), read_only=True) as db:
+                return reconcile.lifecycle(db)
+        except Exception as exc:
+            from stockdata.web.data import _is_lock_error
+            if _is_lock_error(exc):
+                raise DatabaseBusy(tf, external=True) from exc
+            raise
 
 
 def coverage_csv(data: DataAccess, tf: str):

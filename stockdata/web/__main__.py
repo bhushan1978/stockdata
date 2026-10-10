@@ -59,9 +59,10 @@ def _call(port: int, method: str, path: str, body: dict | None = None, timeout: 
 
 
 def server_state(settings: WebSettings) -> tuple[str, dict | None]:
-    """('running', info) | ('unresponsive', info) | ('none', None): is a server of THIS data directory up?"""
+    """('running', info) | ('automation', info) | ('unresponsive', info) | ('none', None): is a server of THIS data directory up?
+    'automation' = a headless automatic update (no web server) currently owns the data directory."""
     info = lifecycle.read_info(settings.server_info)
-    if info:
+    if info and info.get("port"):
         try:
             health = _call(info["port"], "GET", "/api/health", timeout=4)
             if health.get("pid") == info.get("pid"):
@@ -74,6 +75,8 @@ def server_state(settings: WebSettings) -> tuple[str, dict | None]:
         if info:
             lifecycle.remove_info(settings.server_info)
         return "none", None
+    if info and info.get("kind") == "automation":
+        return "automation", info
     return "unresponsive", info
 
 
@@ -102,6 +105,17 @@ def cmd_start(args) -> int:
         print("            Restore webui/dist (for example `git checkout -- webui/dist`) or download the project again.", file=sys.stderr)
         return 1
     state, info = server_state(settings)
+    if state == "automation":
+        print(f"[StockData] An automatic update is running right now (pid {info.get('pid', '?')}, started {info.get('started_at', '?')}).")
+        print("            The application starts when it finishes (waiting up to 20 minutes) ...")
+        for _ in range(240):
+            time.sleep(5)
+            state, info = server_state(settings)
+            if state != "automation":
+                break
+        else:
+            print("[StockData] The automatic update is still running. Try again in a few minutes.", file=sys.stderr)
+            return 5
     if state == "running":
         url = info["url"]
         print(f"[StockData] The application is already running (pid {info['pid']}) at {url}")
@@ -311,6 +325,11 @@ def cmd_stop(args, inp=input) -> int:
         print("Choose only one of --pause-downloads, --keep-downloads, --force.", file=sys.stderr)
         return 1
 
+    if state == "automation":
+        print(f"[StockData] No application server is running. An automatic update (pid {(info or {}).get('pid', '?')}) is in progress and "
+              "ends by itself; nothing was stopped.")
+        return 0
+
     # ---- no responsive server
     if state != "running":
         workers = _tracked_workers(settings)
@@ -421,6 +440,8 @@ def cmd_status(args) -> int:
     print(f"data directory: {settings.data_dir}")
     if state == "running":
         print(f"server: running at {info['url']} (pid {info['pid']})")
+    elif state == "automation":
+        print(f"server: not running; an automatic update is in progress (pid {info.get('pid', '?')})")
     elif state == "unresponsive":
         print(f"server: NOT RESPONDING (pid {(info or {}).get('pid', '?')} holds the lock)")
     else:
@@ -468,6 +489,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("status", help="show the server and download workers")
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
     p.set_defaults(func=cmd_status)
+
+    from stockdata.web import automation_cli
+    automation_cli.register(sub)
     return ap
 
 

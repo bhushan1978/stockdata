@@ -1,6 +1,7 @@
 # stockdata
 
-Reliable downloader for **Dhan equity historical candles** into two completely separate DuckDB databases:
+Reliable downloader for **equity historical candles** (Dhan, FYERS and Upstox through one adapter interface) into two completely
+separate DuckDB databases (one canonical set, whichever provider supplied a candle):
 
 | Database | Endpoint | Candle key |
 |---|---|---|
@@ -13,7 +14,7 @@ Scope is equity history only (no options, expiries or Greeks).
 
 > **Status:** verified live against Dhan on 2026-10-10 for RELIANCE, TCS and INFY (both timeframes, scratch databases):
 > authentication, response schema, date boundaries, epoch/IST conversion, 90-day cap, idempotency, interrupt/resume,
-> integrity, and (new) the explicit `refresh` and the request-limit ledger. 245 automated tests pass. **Not yet done:**
+> integrity, and (new) the explicit `refresh` and the request-limit ledger. 489 automated tests pass (1 skipped; synthetic data only). **Not yet done:**
 > comparison with NSE corporate-action records (so no corporate action is verified and no adjusted data exists), live
 > 429/5xx behaviour, and any full-universe download. See [Status of API assumptions](#status-of-api-assumptions),
 > [docs/DATA_QUALITY.md](docs/DATA_QUALITY.md) and [docs/CORPORATE_ACTIONS.md](docs/CORPORATE_ACTIONS.md).
@@ -21,7 +22,19 @@ Scope is equity history only (no options, expiries or Greeks).
 ## Web interface (Windows-friendly)
 
 A local web application (`start_stockdata.bat`) manages the queue, pause/resume, live progress, charts and data quality on top of this
-downloader without changing it. See [docs/WEBUI.md](docs/WEBUI.md).
+downloader without changing it. See [docs/WEBUI.md](docs/WEBUI.md). It has two clearly separate workflows:
+
+* **Historical Download** — backfill a provider/timeframe/date range in resumable windows; *download missing data* (default), or an
+  explicit repair (*fill gaps* adds only absent candles, *replace* is validated, atomic and audited).
+* **Live & Current Updates** — incremental updates from each instrument's last stored candle (never history), post-close or
+  current-session polling, with freshness, last success and failed instruments; plus **Automation**: unattended runs through the
+  Windows Task Scheduler (headless, no browser, no second web server).
+
+and **Providers** (Dhan, FYERS, Upstox: credentials, connection tests, a capability probe, per-provider limits, default provider),
+**Corporate Actions** (auditable ledger, verified split/bonus adjusted view, raw versus adjusted in the Data Explorer) and **Data
+Quality → Coverage & reconciliation / Instrument lifecycle**. Architecture constraints, provider coverage differences,
+authentication requirements, Task Scheduler setup and the honest limitations are in
+[docs/PROVIDERS_AND_AUTOMATION.md](docs/PROVIDERS_AND_AUTOMATION.md).
 
 ## Setup
 
@@ -85,6 +98,20 @@ python -m stockdata report 15min --csv     # per-instrument coverage + integrity
 
 Exit codes: `0` completed, `2` completed with failed/retriable windows (refresh: or held/absent candles to review), `3` aborted, `4` stopped at a request limit, `5` stopped on request (only when a supervisor such as the web interface asks; resume = the same command), `130` interrupted.
 DuckDB allows one writer per file, so `report`/`status` cannot open a file while a download on it is running.
+
+### Providers and incremental updates
+
+```bash
+python -m stockdata download daily --symbols RELIANCE --provider fyers --dry-run   # a provider per command; same databases
+python -m stockdata update daily --all --dry-run                                  # post-close update: from each last candle, never history
+python -m stockdata update 15min --all --mode current --poll-seconds 300          # completed bars of the session in progress (provisional)
+python -m stockdata refresh daily --symbols RELIANCE --start-date 2024-01-01 --fill-only   # add absent candles only, keep every stored one
+python -m stockdata.web automation status|install|run                              # the scheduled-task entry point (see docs)
+```
+
+A candle's provider is recorded; the first stored candle is kept and a differing re-fetch (another provider, a late revision) is
+recorded in `candle_revisions` (view `provider_disagreements`). Replacing candles that came from another provider needs
+`refresh --allow-cross-provider`. Per-provider request budgets share the one ledger.
 
 ### Refreshing history (explicit, audited)
 
@@ -218,8 +245,9 @@ application cannot see other applications' usage.
 pip install -r requirements-dev.txt && pytest -q
 ```
 
-326 tests run against `tests/fake_dhan.py`, a *synthetic* local server (instruments are `SIM*`); the web-interface tests also start real
-worker processes and a real server process. They demonstrate the
+489 tests run against `tests/fake_dhan.py`, `tests/fake_providers.py` (synthetic local FYERS and Upstox servers modelled on the
+official SDK sources) and the Dhan server (instruments are `SIM*`); the web-interface tests also start real worker processes and a
+real server process. **No provider has been contacted by any test or smoke run.** They demonstrate the
 mechanics (boundaries, timestamps, idempotency, retry, resume, atomic commit, isolation, corporate-action methodology on
 constructed series). They are not evidence about real Dhan or NSE data.
 
@@ -235,7 +263,11 @@ constructed series). They are not evidence about real Dhan or NSE data.
 * The request counter only covers this application; other users of the same Dhan account are invisible to it.
 * The universe is whatever `config/universe.toml` selects (NSE `EQ` equity shares, 2,351 today); delisted instruments are not in
   today's master, so their history is not downloaded.
-* The compact master has no ISIN; ISIN-based event mapping needs the detailed master.
+* The compact master has no ISIN; ISIN-based event mapping and **Upstox** need the detailed master (Instruments → Refresh → Detailed).
+* **FYERS and Upstox have never been called** (their limits, earliest dates and adjustment basis are *documented, unverified* until
+  the capability probe is run with real credentials); FYERS needs an interactive daily login, so unattended updates cannot be
+  promised for it. The **Windows Task Scheduler backend has not been executed on Windows**. See
+  [docs/PROVIDERS_AND_AUTOMATION.md](docs/PROVIDERS_AND_AUTOMATION.md).
 * Recent intraday sessions (from 2026-08-03) end at 15:15 in every interval, and some older periods carry a 15:30 bar, so
   15-minute volume is not guaranteed to add up to the daily volume. Missing candles are never synthesized.
 * One writer per DuckDB file; requests are sequential (by design, to stay far below rate limits).

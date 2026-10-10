@@ -223,16 +223,17 @@ def test_the_request_budget_is_enforced_through_the_shared_ledger(web_env, fake,
     for _ in range(79_998):
         pass
     con = seeded._con
-    con.execute("INSERT INTO usage VALUES (?, 'otherapp', ?, 'x')", (seeded.day(), 79_998))
+    con.execute("INSERT INTO usage VALUES (?, 'otherapp', ?, 'x')", (seeded.day(), 77_998))
     job = env.create(intraday_spec())["job"]
     usage = env.client.get("/api/usage").json()
-    assert usage["used_today"] == 79_998 and usage["remaining_day"] == 2 and usage["max_per_day"] == 80_000
+    # a historical job leaves the live reserve (2,000 of the day's requests) untouched, so it may use only 2 more of the 80,000
+    assert usage["used_today"] == 77_998 and usage["remaining_day"] == 2_002 and usage["max_per_day"] == 80_000
     plan = env.client.post("/api/plan", json=intraday_spec()).json()
     assert plan["budget"]["fits"] is False and any(w["type"] == "budget" for w in plan["warnings"])
     drive(env, status_is(env, job["id"], "stopped_by_limit"), message="stop at the day cap")
     j = env.job(job["id"])
     assert j["exit_code"] == 4 and "budget" in j["next_action"].lower() and j["attempts_used"] == 2
-    assert sum(read_usage(ledger).values()) == 80_000                                  # never exceeded the cap
+    assert sum(read_usage(ledger).values()) == 78_000                                  # stopped at the cap minus the live reserve
     seeded.close()
 
 

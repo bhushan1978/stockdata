@@ -60,3 +60,21 @@ For RELIANCE, TCS and INFY the number of bars per session depends on the date:
   Intraday depth is at least the documented five years.
 * **Dhan adjusts retroactively (apparently)**, so previously stored candles go stale at the next split/bonus. Use `refresh` for
   an explicit, audited replacement of the affected symbol and range.
+
+## Coverage, reconciliation and instrument lifecycle (read-only)
+
+The Data Quality screen has two more sections next to the integrity checks (`stockdata/reconcile.py`, no request is ever sent and no
+candle is ever created, changed or filled in):
+
+* **Missing sessions** — market sessions inside an instrument's own stored range on which it has no candle. The session calendar is
+  *inferred from the data* (a date on which at least half of the instruments whose history spans it have a candle), so holidays
+  need no list; an instrument is never expected before its first or after its last stored candle. A targeted repair (`refresh
+  --fill-only`) adds only the absent candles.
+* **Final-candle completeness** (15-minute) — sessions whose last bar starts before 15:00 (15:15, or 15:00 for F&O stocks after 3
+  August 2026, are both complete) and sessions with very few bars.
+* **Stale instruments** — active instruments whose last candle is older than the latest session.
+* **Abnormal volume** — sessions with more than 20x the median volume of the previous 20 sessions: a lead (corporate actions,
+  results days, index inclusions), not an error.
+* **Provider disagreements** — candles where two providers (or two fetches) gave different values; the stored value is kept.
+* **Instrument lifecycle** — renames, symbols used by different securities, one ISIN on several security ids, new listings and
+  instruments that left the master. Candles belong to a security id, never to a symbol.
