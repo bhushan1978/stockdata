@@ -11,11 +11,11 @@ Each file holds its own candles, instrument reference data, **download checkpoin
 reference. A file records its timeframe and refuses to be opened as the other one; nothing ever `ATTACH`es the other.
 Scope is equity history only (no options, expiries or Greeks).
 
-> **Status:** the code is complete and unit/integration-tested against a *synthetic local server*. It has **not yet been
-> run against the live Dhan API or checked against NSE records** (the cloud session had no credentials and no network
-> route to Dhan/NSE). See [Status of API assumptions](#status-of-api-assumptions) and
-> [docs/CORPORATE_ACTIONS.md](docs/CORPORATE_ACTIONS.md). Do not start a full-universe download until the live checks
-> have passed.
+> **Status:** verified live against Dhan on 2026-10-10 for RELIANCE, TCS and INFY (both timeframes, scratch databases):
+> authentication, response schema, date boundaries, epoch/IST conversion, 90-day cap, idempotency, interrupt/resume and
+> integrity all pass (38/38 self-check, 180 tests). **Not yet done:** comparison with NSE corporate-action records, live
+> rate-limit/5xx behaviour, and any full-universe download. See [Status of API assumptions](#status-of-api-assumptions)
+> and [docs/CORPORATE_ACTIONS.md](docs/CORPORATE_ACTIONS.md).
 
 ## Setup
 
@@ -100,39 +100,60 @@ DuckDB allows one writer per file, so `report`/`status` cannot open a file while
 
 ## Status of API assumptions
 
-**Live verification against real Dhan data: NOT YET RUN.** It was blocked because the session had no credentials
-(`.env` is git-ignored, so it never reaches a cloud checkout) and the network policy rejected Dhan and NSE hosts.
-Nothing below was confirmed by a live call.
+Three layers of evidence, strongest last: the official SDK source, the maintainer's reading of the official documentation,
+and live calls (`verify-api`, `selfcheck`, 2026-10-10, RELIANCE/TCS/INFY).
 
-### Documentation-confirmed
+### Documentation-confirmed (maintainer's review of the official Dhan docs)
 
-Confirmed by the maintainer's review of the official Dhan documentation (2026-10-10). The build environment could not
-fetch the documentation itself, so these were *recorded as instructed*, not independently re-read.
+Daily history from instrument inception; exclusive daily `toDate`; 15-minute interval with up to five years of history and a
+maximum 90-day window; Historical Data limits of 5 requests/second and 100,000 requests/day; official compact and detailed
+instrument-master CSV URLs. The implementation defaults to 3 requests/second. **The 100,000/day cap is not enforced in
+code**: it is account-wide, shared by both downloaders, and retries count; use `download --dry-run` to count a run first.
 
-| Documented fact | How the implementation uses it |
+### Confirmed live (2026-10-10)
+
+| Behaviour | Observed |
 |---|---|
-| Daily historical data is available from instrument inception | request floor is `DAILY_HISTORY_START` = 1990-01-01; pre-listing windows are expected to be empty. Whether one 1990→today request is accepted is **not** documented and is a live check |
-| Daily `toDate` is exclusive | the window end is sent unchanged as `toDate`; validation still fails any window that contains a candle dated `toDate` |
-| Intraday intervals include 15 minutes; up to five years of history; maximum 90-day request window | `interval = 15`; windows of 89 days (hard cap 90); history start = five years before the first run, then pinned |
-| Historical Data APIs: 5 requests/second and 100,000 requests/day | default 3 requests/second (never above 5). **The 100,000/day cap is not enforced in code**: it is account-wide, shared by both downloaders, and retries count. Use `download --dry-run` to count a run's requests first |
-| Official compact and detailed instrument-master CSV URLs | `config.MASTER_URLS` (the same two URLs appear in the official SDK 2.3.0 source) |
+| Authentication | `access-token` + `client-id` headers accepted. A bad token gives `HTTP 401 DH-901 "Client ID or user generated access token is invalid or expired."`, classified as an auth error and never retried |
+| Response schema | arrays `open, high, low, close, volume, timestamp` (no `open_interest` for equities); `volume` arrives as an integral float; prices have at most 2 decimals |
+| Epoch base | Unix 1970 seconds (every timestamp falls inside the requested window; the pre-v2 1980 base scores 0) |
+| Daily timestamps | midnight IST; daily candles are the IST date |
+| Daily `toDate` | **exclusive**: the last day is absent when `toDate` is that day and present when it is the next day |
+| Daily range | one request from 1990-01-01 to today is accepted (RELIANCE 6,159 candles). History starts at Dhan's own data start, not the exchange listing: RELIANCE 2002-01-01, INFY 2003-09-05, TCS 2004-08-25 |
+| Intraday span | 89 and 90 days accepted; 91 and 100 rejected with `HTTP 400 DH-905 "Data for Intraday Charts can be fetched for 90 days at a time"` |
+| Intraday interval and dates | `interval` 15 as integer or string, and `fromDate`/`toDate` as `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`, all return identical bars |
+| Bar timestamps | mark the bar **start** (first bar 09:15) |
+| Intraday depth | a window starting 2021-08-11 (5 years + 60 days before the test) still returned data, so depth is at least the documented five years |
+| Empty windows | **differ by endpoint**: intraday returns `200` with empty arrays; daily returns `HTTP 400 DH-907 "...incorrect parameters or no data present"`, which cannot be told apart from a bad request. Hence the daily default is one window for the whole history, and `DH-907` is never assumed to mean "empty" |
+| Instrument master | compact CSV (207,560 rows): `NSE | E | EQUITY | EQ` has 2,725 rows = 2,351 equity shares (`ES`) + 351 ETFs + 22 `Other` (incl. NSE test symbols) + 1 MF. The universe is therefore restricted to `ES`: 2,351 rows, unique security ids and symbols. RELIANCE = 2885, TCS = 11536, INFY = 1594 (NSE_EQ). The compact master has **no ISIN** |
+| Idempotency / resume | rerun requests nothing; forced re-download adds no rows and no revisions; a real SIGINT mid-download left a clean checkpoint and the same command resumed only the missing windows (63 windows over 3 symbols, none repeated, no duplicates) |
 
-Also seen in the official SDK 2.3.0 source (a client library, not the API page): endpoint paths, request field names,
-`interval` values 1/5/15/25/60, the `NSE_EQ` segment, the `access-token` header, and Unix-epoch → IST conversion.
+### Data findings to know about
 
-### Still requires live verification
+* **Intraday sessions are not uniform.** Bars per session: 26 (a bar starting 15:30) in 2021-10 to 2022-05 and 2024-05 to 2024-11,
+  25 (09:15 to 15:15) for most other dates, and **24 (last bar 15:00) from 2026-08-03 onward**. For those recent sessions even the
+  1-minute data ends at 15:14, with identical volume totals across intervals, while the daily volume is larger; so the intraday
+  feed stops at 15:15 there and 15-minute volume does not add up to the daily volume. Cause unknown (exchange schedule change or a
+  Dhan data change); to be confirmed against NSE.
+* **Special sessions are real data** and are stored as received and flagged in `data_anomalies`: Muhurat evening sessions
+  (`outside_session`), Saturday/Sunday sessions incl. the Sunday 2026-02-01 Budget session (`weekend_candle`), a 15:30 bar
+  (`post_close_bar`), and odd off-grid bars (`off_grid`).
+* **Negative volume exists.** On Saturday 2022-04-09 12:45 one bar per symbol has negative volume (RELIANCE -35,067,964, followed
+  by +52,148,702). It is stored exactly as received and flagged (`negative_volume`) instead of failing the whole 89-day window.
+* **Dhan's history looks already split/bonus-adjusted**: see [docs/CORPORATE_ACTIONS.md](docs/CORPORATE_ACTIONS.md).
+  Consequence: stored history goes stale at the next split/bonus; `--refetch` records the differences in `candle_revisions`
+  but does not overwrite first-seen candles, so a replace/refresh step is still needed before relying on long-lived stores.
 
-`python -m stockdata verify-api` and `selfcheck` are built to settle these; until they have run, they stay unconfirmed.
+### Still unverified
 
-| Behaviour | Why it is not settled |
+| Behaviour | Why |
 |---|---|
-| **Intraday boundary behaviour**: whether exactly 90 days is accepted, whether 91 is rejected, how `fromDate`/`toDate` are treated at midnight, the accepted date format (`YYYY-MM-DD HH:MM:SS` vs `YYYY-MM-DD`) | documentation gives only the 90-day maximum; windows are midnight-aligned and 89 days long so the defaults do not depend on the answer |
-| Bar timestamp convention (bar start vs end) and the actual epoch values (daily = midnight IST?) | only seen in the SDK; the validator fails any window whose candles fall outside the requested range or off the 09:15 + 15-minute grid |
-| **Instrument-master rows for NSE cash equities**: real column names, the `EXCH_ID`/`SEGMENT`/`INSTRUMENT`/`SERIES` values, ETFs and other series, duplicates | the CSV has never been read here; the parser fails loudly and `instruments summary` prints the real values |
-| How an empty window is signalled (empty arrays vs an error code) and the meaning of Dhan error codes (DH-9xx) | unknown codes fail the window; an error is never treated as "no data" unless opted in with `--empty-error-codes` |
-| Whether a single very long daily request is accepted | range limit for daily is not documented; `--window-days` controls it |
-| Float representation of prices (e.g. 1234.5500488) | prices are stored as received (`DOUBLE`) |
-| Whether Dhan's candles are raw or split/bonus-adjusted | **unknown**; see [docs/CORPORATE_ACTIONS.md](docs/CORPORATE_ACTIONS.md) |
+| Live rate-limit (`429`) and `5xx` behaviour, and live retries | not provoked on purpose; retries are tested only against injected faults |
+| The 100,000 requests/day cap | documented, not enforced or exercised |
+| Whether Dhan **volumes** are adjusted as well as prices | strongly suggested by continuity; needs NSE raw volumes |
+| Every corporate-action ex-date, ratio and the raw/adjusted conclusion | NSE hosts did not respond (see corporate actions) |
+| Detailed instrument master (ISIN, other type codes) | only its URL was checked; needed for ISIN-based event mapping |
+| Cause of the 24-bar sessions after 2026-08-03 and of the 15:30 bars | observed, not explained |
 
 ## Tests
 
@@ -140,16 +161,22 @@ Also seen in the official SDK 2.3.0 source (a client library, not the API page):
 pip install -r requirements-dev.txt && pytest -q
 ```
 
-158 tests run against `tests/fake_dhan.py`, a *synthetic* local server (instruments are `SIM*`). They demonstrate the
+180 tests run against `tests/fake_dhan.py`, a *synthetic* local server (instruments are `SIM*`). They demonstrate the
 mechanics (boundaries, timestamps, idempotency, retry, resume, atomic commit, isolation, corporate-action methodology on
 constructed series). They are not evidence about real Dhan or NSE data.
 
 ## Limitations
 
-* Not yet exercised live; see the status table. Corporate-action verification is **pending** (no verified events yet),
-  so no adjusted data has been generated.
-* The universe is whatever `config/universe.toml` selects; delisted instruments are not in today's master, so their
-  history is not downloaded.
-* Prices are stored as `DOUBLE` as received; whether Dhan serves float32-style noise (e.g. 1234.5500488) is unchecked.
+* Live-verified on three symbols only. Corporate-action verification against NSE is **pending** (NSE hosts did not respond),
+  no corporate action is verified, and no adjusted data has been generated. Dhan's history appears to be *already*
+  adjusted, so adjustment stays disabled; see [docs/CORPORATE_ACTIONS.md](docs/CORPORATE_ACTIONS.md).
+* Stored history goes stale when Dhan adjusts retroactively after a future split/bonus. Differences are detected and logged
+  (`candle_revisions`) but there is no replace/refresh command yet.
+* The universe is whatever `config/universe.toml` selects (NSE `EQ` equity shares, 2,351 today); delisted instruments are not in
+  today's master, so their history is not downloaded.
+* The compact master has no ISIN; ISIN-based event mapping needs the detailed master.
+* Recent intraday sessions (from 2026-08-03) end at 15:15 in every interval, and some older periods carry a 15:30 bar, so
+  15-minute volume is not guaranteed to add up to the daily volume.
+* The 100,000 requests/day cap is not enforced in code.
 * One writer per DuckDB file; requests are sequential (by design, to stay far below rate limits).
 * The `PRIMARY KEY` indexes make the ~60M-row 15-minute table memory-hungry during bulk loading on small machines.

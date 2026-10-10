@@ -2,10 +2,32 @@
 
 ## Current status (read this first)
 
-**No corporate action has been verified yet.** The build environment could not reach Dhan, NSE or any NSE data source,
-so Dhan's behaviour (raw vs adjusted) is still **unknown**, no events have been imported, and **no adjusted candles
-exist**. Everything below describes the machinery and the procedure that decides it. Until the procedure has been run,
-treat *all* history as **not adjustment-validated**, and do not assume prices or volumes are adjusted *or* unadjusted.
+**No corporate action has been verified against NSE, and adjustment processing is disabled.** NSE hosts accepted the
+connection but never answered (`curl: (92) HTTP/2 ... INTERNAL_ERROR`, `curl: (28) timed out`), so no official ex-date, ratio or
+raw NSE price has been compared yet. That comparison is still required before anything is called verified.
+
+**Dhan-only evidence (2026-10-10, RELIANCE/TCS/INFY, real data) strongly suggests Dhan's history is already split/bonus-adjusted:**
+
+* The gap scan over the full daily history (2002 to 2026) and the 15-minute history (2021-10 to 2026-10) finds **no overnight gap
+  near 0.5 at any date from 2007 on**: the largest gaps in 2015 to 2026 are 0.90 and 1.08, all market moves.
+* Around 2024-10-28 (RELIANCE) the daily series is continuous (open/prev-close 1.0069, volume 10.8M versus 9.3M the session
+  before) and the 15-minute series agrees. The same holds around 2017-09-07 (RELIANCE) and 2018-06-14 (TCS).
+* Price levels are far below what those stocks traded at before their bonus issues (Dhan shows RELIANCE 1,327.85 on 2024-10-25,
+  TCS about 1,750 in June 2018), which is what an adjusted series looks like. These raw-price recollections are not authoritative.
+
+So applying our own factors would **double-adjust**; `evaluate` classifies such events `source_adjusted` and never applies them.
+This is strong but **unverified** evidence: it rests on the believed ex-dates above, which have not been confirmed from NSE.
+Dhan volumes show no step at those dates either (consistent with adjusted volume), also unverified.
+
+**Unresolved candidates from the scan (not verified, not adjusted).** Large gaps that were *not* adjusted away, all in
+2003 to 2009: RELIANCE 2003-09-29 (1.196), 2003-10-24 (0.806), 2003-12-23 (0.825), **2005-01-03 (0.505, volume ratio 0.99)**,
+2006-01-18 (0.768), 2004-04-02 (1.169); INFY 2003-10-24 (1.177); TCS 2009-05-18 (1.190, likely a market-wide circuit day).
+They may be market moves, unadjusted older events, or restructurings (demerger/merger) that cannot be adjusted generically.
+Treat every period before 2010 as **not adjustment-validated**.
+
+**Operational consequence.** Because Dhan adjusts retroactively, every stored candle before a future split/bonus becomes stale on
+that date. The 7-day overlap on incremental runs logs the difference in `candle_revisions`, but `--refetch` keeps first-seen
+candles, so a replace/refresh mechanism is needed before a long-lived store can be trusted across corporate actions.
 
 ## Principles
 

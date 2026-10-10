@@ -26,7 +26,10 @@ DEFAULT_RPS = 3.0
 
 MAX_INTRADAY_WINDOW_DAYS = 90      # hard cap: never request more than this per call
 DEFAULT_INTRADAY_WINDOW_DAYS = 89  # one day of margin under the cap
-DEFAULT_DAILY_WINDOW_DAYS = 3650   # daily range limit is not documented; see verify-api
+# Verified live (verify-api, 2026-10-10): the daily endpoint accepted one 1990 -> today request
+# (6,159 candles). Empty daily windows come back as an ambiguous HTTP 400 DH-907 ("incorrect parameters
+# or no data present"), so use ONE window for the whole history: no pre-listing windows to misread.
+DEFAULT_DAILY_WINDOW_DAYS = 40_000
 INTRADAY_HISTORY_YEARS = 5
 DAILY_HISTORY_START = date(1990, 1, 1)
 

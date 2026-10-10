@@ -8,4 +8,7 @@ exchange_id = "NSE"
 segment_code = "E"        # E = equity/cash segment
 instrument = "EQUITY"
 series = ["EQ"]
-# instrument_types = []   # optional filter on the exchange instrument-type column
+# Verified against the live compact master (2026-10-10): NSE|E|EQUITY|EQ holds 2,725 rows =
+# 2,351 equity shares (ES) + 351 ETF + 22 "Other" (incl. NSE test symbols such as 11NSETEST) + 1 MF.
+# Restricting to ES gives 2,351 rows with unique security ids and unique symbols.
+instrument_types = ["ES"]

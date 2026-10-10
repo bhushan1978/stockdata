@@ -65,7 +65,7 @@ def test_length_mismatch_rejected():
 
 @pytest.mark.parametrize("field,value,code", [
     ("open", None, "non_numeric_price"), ("high", float("nan"), "non_numeric_price"),
-    ("volume", None, "non_numeric_volume"), ("volume", -5, "negative_volume"),
+    ("volume", None, "non_numeric_volume"),
     ("volume", 12.5, "non_integer_volume"), ("timestamp", None, "non_numeric_timestamp")])
 def test_bad_values_rejected(field, value, code):
     b = body(bars())
@@ -73,6 +73,35 @@ def test_bad_values_rejected(field, value, code):
     with pytest.raises(ValidationError) as e:
         validate_response(INTRADAY_15, b, WIN_I)
     assert e.value.code == code
+
+
+def test_negative_volume_is_kept_as_received_and_flagged_not_discarded():
+    """Seen live: a bar with volume -35,067,964 in a special Saturday session. One bad bar must not
+    discard 89 days of valid data, and the value must be stored exactly as Dhan sent it."""
+    session = [(datetime(2024, 5, 6, 9, 15) + timedelta(minutes=15 * i), 100, 101, 99, 100, 5) for i in range(25)]
+    session[7] = (session[7][0], 100, 101, 99, 100, -35_067_964)
+    v = validate_response(INTRADAY_15, body(session), WIN_I)
+    assert v.n == 25 and int(v.candles["volume"].iloc[7]) == -35_067_964
+    assert list(v.anomalies["kind"]) == ["negative_volume"]
+    assert "-35067964" in v.anomalies["detail"].iloc[0]
+
+
+def test_widespread_negative_volume_is_a_systematic_field_problem():
+    session = [(datetime(2024, 5, 6, 9, 15) + timedelta(minutes=15 * i), 100, 101, 99, 100, -5) for i in range(25)]
+    with pytest.raises(ValidationError) as e:
+        validate_response(INTRADAY_15, body(session), WIN_I)
+    assert e.value.code == "systematic_anomalies"
+
+
+def test_special_weekend_sessions_are_flagged_but_never_make_a_window_systematic():
+    rows = []
+    for day in (date(2024, 5, 6), date(2024, 5, 7), date(2024, 5, 8), date(2024, 5, 9)):          # 4 weekday sessions
+        rows += [(datetime.combine(day, time(9, 15)) + timedelta(minutes=15 * i), 100, 101, 99, 100, 5) for i in range(25)]
+    for day in (date(2024, 5, 4), date(2024, 5, 11)):                                              # 2 Saturday sessions
+        rows += [(datetime.combine(day, time(9, 15)) + timedelta(minutes=15 * i), 100, 101, 99, 100, 5) for i in range(25)]
+    v = validate_response(INTRADAY_15, body(rows), WIN_I)       # 50 of 150 bars (33%) are weekend: still accepted
+    assert v.n == 150
+    assert set(v.anomalies["kind"]) == {"weekend_candle"} and v.anomalies["candle_key"].nunique() == 50
 
 
 def test_integral_float_volume_accepted():
@@ -147,3 +176,27 @@ def test_intraday_off_grid_and_outside_session_flagged_when_isolated():
     rows.append((datetime(2024, 5, 6, 18, 15), 100, 101, 99, 100, 5))   # muhurat-style evening bar
     v = validate_response(INTRADAY_15, body(rows), WIN_I)
     assert v.n == 26 and list(v.anomalies["kind"]) == ["outside_session"]
+
+
+def test_a_1530_bar_is_a_flagged_post_close_bar_and_does_not_count_as_systematic():
+    """Seen live: many real sessions carry a bar starting 15:30. One per 26-bar session (3.8%) sits just under
+    the systematic cutoff, so it must not be counted toward it at all."""
+    rows = []
+    for day in (date(2024, 5, 6), date(2024, 5, 7), date(2024, 5, 8)):
+        rows += [(datetime.combine(day, time(9, 15)) + timedelta(minutes=15 * i), 100, 101, 99, 100, 5) for i in range(26)]
+    rows[7] = (rows[7][0], 100, 99, 99.5, 100, 5)                       # plus one unrelated OHLC oddity
+    rows[33] = (rows[33][0], 100, 99, 99.5, 100, 5)
+    v = validate_response(INTRADAY_15, body(rows), WIN_I)
+    assert v.n == 78
+    kinds = v.anomalies["kind"].value_counts().to_dict()
+    assert kinds == {"post_close_bar": 3, "ohlc_relation": 2}
+
+
+def test_a_time_base_shift_is_still_caught_even_though_1530_is_tolerated():
+    rows = []
+    for day in (date(2024, 5, 6), date(2024, 5, 7)):
+        rows += [(datetime.combine(day, time(9, 15)) + timedelta(minutes=15 * i) + timedelta(hours=5, minutes=30),
+                  100, 101, 99, 100, 5) for i in range(25)]             # IST read as UTC: bars land 14:45 .. 21:00
+    with pytest.raises(ValidationError) as e:
+        validate_response(INTRADAY_15, body(rows), WIN_I)
+    assert e.value.code == "systematic_anomalies"

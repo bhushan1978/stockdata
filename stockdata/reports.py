@@ -29,7 +29,6 @@ def integrity_checks(db: CandleDB) -> list[Check]:
               "HAVING count(*) > 1)"))
     check("prices positive and finite", one(f"SELECT count(*) FROM {t} WHERE open <= 0 OR high <= 0 "
                                             "OR low <= 0 OR close <= 0 OR NOT isfinite(open + high + low + close)"))
-    check("volume non-negative", one(f"SELECT count(*) FROM {t} WHERE volume < 0"))
     check("OHLC relations (low <= open,close <= high)",
           one(f"SELECT count(*) FROM {t} WHERE low > least(open, close) OR high < greatest(open, close)"),
           "(also listed in data_anomalies; stored as received)")
@@ -46,17 +45,28 @@ def integrity_checks(db: CandleDB) -> list[Check]:
     check("candles per window match recorded rows",
           one(f"SELECT count(*) FROM download_windows w WHERE w.status = 'complete' AND "
               f"(SELECT count(*) FROM {t} c WHERE c.window_id = w.window_id) > w.rows_received"))
+    # A candle that is odd-but-legitimate (a special session) is acceptable only if it was flagged on ingest.
+    def unflagged(condition: str, kinds: str) -> int:
+        return one(f"SELECT count(*) FROM {t} WHERE ({condition}) AND NOT EXISTS (SELECT 1 FROM data_anomalies a "
+                   f"WHERE a.exchange_segment = {t}.exchange_segment AND a.security_id = {t}.security_id "
+                   f"AND a.candle_key = CAST({t}.{k} AS TIMESTAMP) AND a.kind IN ({kinds}))")
+
+    n_neg = one(f"SELECT count(*) FROM {t} WHERE volume < 0")
+    check("volume non-negative, or flagged as negative_volume", unflagged("volume < 0", "'negative_volume'"),
+          f"({n_neg} flagged negative-volume candle(s) present, stored as received)")
     if tf.is_intraday:
-        check("bars on the 15-minute grid inside 09:15-15:30 IST",
-              one(f"SELECT count(*) FROM {t} WHERE hour({k}) * 60 + minute({k}) < 555 "
-                  f"OR hour({k}) * 60 + minute({k}) >= 930 OR (hour({k}) * 60 + minute({k}) - 555) % 15 <> 0 "
-                  f"OR second({k}) <> 0"), "(special sessions are flagged in data_anomalies)")
+        off = (f"hour({k}) * 60 + minute({k}) < 555 OR hour({k}) * 60 + minute({k}) >= 930 "
+               f"OR (hour({k}) * 60 + minute({k}) - 555) % 15 <> 0 OR second({k}) <> 0")
+        n_special = one(f"SELECT count(*) FROM {t} WHERE {off}")
+        check("bars on the 15-minute grid inside 09:15-15:30 IST, or flagged as special sessions",
+              unflagged(off, "'outside_session', 'off_grid', 'post_close_bar'"), f"({n_special} flagged special-session bar(s) present)")
         check("epoch_raw round-trips to candle_timestamp (Asia/Kolkata)",
-              one(f"SELECT count(*) FROM {t} WHERE epoch_raw <> "
-                  f"epoch({k} - INTERVAL 330 MINUTE)"))
+              one(f"SELECT count(*) FROM {t} WHERE epoch_raw <> epoch({k} - INTERVAL 330 MINUTE)"))
     else:
-        check("candle_date is a weekday", one(f"SELECT count(*) FROM {t} WHERE dayofweek({k}) IN (0, 6)"),
-              "(special weekend sessions are flagged in data_anomalies)")
+        weekend = f"dayofweek({k}) IN (0, 6)"
+        n_weekend = one(f"SELECT count(*) FROM {t} WHERE {weekend}")
+        check("candle_date is a weekday, or flagged as a special weekend session",
+              unflagged(weekend, "'weekend_candle'"), f"({n_weekend} flagged weekend candle(s) present)")
         check("epoch_raw round-trips to candle_date (midnight Asia/Kolkata)",
               one(f"SELECT count(*) FROM {t} WHERE epoch_raw <> epoch(CAST({k} AS TIMESTAMP) - INTERVAL 330 MINUTE)"))
     return out

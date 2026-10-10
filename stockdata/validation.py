@@ -27,6 +27,9 @@ SESSION_CLOSE_MIN = 15 * 60 + 30
 SYSTEMATIC_FRACTION = 0.05
 SYSTEMATIC_MIN_ROWS = 20
 SYSTEMATIC_TINY_FRACTION = 0.5
+# Informational findings (a genuine special weekend session) must never make a window "systematic".
+SYSTEMATIC_KINDS = {"ohlc_relation", "non_positive_price", "negative_volume", "outside_session", "off_grid",
+                    "daily_timestamp_not_midnight_ist"}
 
 
 class ValidationError(Exception):
@@ -85,7 +88,7 @@ def validate_response(tf: Timeframe, body, window: Window) -> Validated:
         if s.isna().any() or not np.isfinite(s.to_numpy(dtype="float64")).all():
             raise ValidationError("non_numeric_price", f"{col} contains null or non-numeric values")
         df[col] = s.astype("float64")
-    df["volume"] = _as_integers(df["volume"], "volume", non_negative=True)
+    df["volume"] = _as_integers(df["volume"], "volume")      # negatives are kept and flagged, see _find_anomalies
     df["epoch_raw"] = _as_integers(df["timestamp"], "timestamp")
     try:
         ist = epoch_to_ist_naive(df["epoch_raw"])
@@ -108,7 +111,7 @@ def validate_response(tf: Timeframe, body, window: Window) -> Validated:
         )
 
     anomalies = _find_anomalies(tf, df, ist, key)
-    flagged = anomalies["candle_key"].nunique()
+    flagged = anomalies.loc[anomalies["kind"].isin(SYSTEMATIC_KINDS), "candle_key"].nunique()
     n = len(df)
     systematic = (n >= SYSTEMATIC_MIN_ROWS and flagged / n > SYSTEMATIC_FRACTION) or \
                  (n < SYSTEMATIC_MIN_ROWS and flagged / n > SYSTEMATIC_TINY_FRACTION)
@@ -137,12 +140,19 @@ def _find_anomalies(tf: Timeframe, df: pd.DataFrame, ist: pd.Series, key: pd.Ser
     flag((h < np.maximum(o, c)) | (l > np.minimum(o, c)) | (h < l), "ohlc_relation",
          "o=" + o.astype(str) + " h=" + h.astype(str) + " l=" + l.astype(str) + " c=" + c.astype(str))
     flag((df[list(PRICE_COLS)] <= 0).any(axis=1), "non_positive_price", "price <= 0")
+    # Seen live (RELIANCE/TCS/INFY, Saturday 2022-04-09): a bar with negative volume. Stored as received.
+    flag(df["volume"] < 0, "negative_volume", "volume " + df["volume"].astype(str))
     if tf.is_intraday:
         mod = ist.dt.hour * 60 + ist.dt.minute
         inside = (mod >= SESSION_OPEN_MIN) & (mod < SESSION_CLOSE_MIN)
-        flag(~inside, "outside_session", "bar start " + ist.dt.strftime("%H:%M"))
+        # Seen live: many sessions carry a bar starting 15:30 (closing/post-close trades). It is real data and
+        # informational, unlike a bar far outside the session (a time-base problem), so it is a separate kind.
+        post_close = (mod >= SESSION_CLOSE_MIN) & (mod < SESSION_CLOSE_MIN + 30)
+        flag(post_close, "post_close_bar", "bar start " + ist.dt.strftime("%H:%M"))
+        flag(~inside & ~post_close, "outside_session", "bar start " + ist.dt.strftime("%H:%M"))
         flag(inside & (((mod - SESSION_OPEN_MIN) % tf.interval != 0) | (ist.dt.second != 0)),
              "off_grid", "bar start " + ist.dt.strftime("%H:%M:%S"))
+        flag(key.dt.dayofweek >= 5, "weekend_candle", "date " + key.dt.strftime("%Y-%m-%d"))
     else:
         flag(ist != key, "daily_timestamp_not_midnight_ist", "time " + ist.dt.strftime("%H:%M:%S"))
         flag(key.dt.dayofweek >= 5, "weekend_candle", "date " + key.dt.strftime("%Y-%m-%d"))

@@ -70,9 +70,11 @@ def run(args, settings: Settings) -> int:
             n1 = count()
             rec.add(f"{tf.name}: first run completed without failed/retriable windows",
                     s1["status"] == "completed", f"{s1['status']} {s1['note']}")
+            chosen = {i.security_id for i in insts}     # coverage() lists the whole loaded universe
             per = coverage(db)
-            rec.add(f"{tf.name}: every selected symbol has candles", bool((per["candles"].fillna(0) > 0).all()),
-                    f"{n1:,} rows; " + ", ".join(f"{r.symbol}={int(r.candles or 0)}" for r in per.itertuples()))
+            per = per[per["security_id"].isin(chosen)].assign(candles=lambda d: d["candles"].fillna(0).astype(int))
+            rec.add(f"{tf.name}: every selected symbol has candles", bool((per["candles"] > 0).all()),
+                    f"{n1:,} rows; " + ", ".join(f"{r.symbol}={r.candles}" for r in per.itertuples()))
             before = db.con.execute(f"SELECT * FROM {tf.table} ORDER BY ALL").fetchall()
             s2 = dl.run(insts, opts, command="selfcheck run 2 (idempotency)")
             rec.add(f"{tf.name}: second run requested nothing", s2["attempted"] == 0, f"{s2['attempted']} windows attempted")

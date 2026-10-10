@@ -111,6 +111,15 @@ def test_selfcheck_end_to_end_passes_and_is_isolated_from_the_real_databases(cli
     assert all(r["ok"] for r in report["results"])
 
 
+def test_selfcheck_with_a_partial_selection_of_a_larger_loaded_universe(cli, fake, capsys):
+    """Regression: the real universe holds thousands of instruments, only a few of which are downloaded
+    (their candle counts are NA in the coverage table)."""
+    code = cli("selfcheck", "--file", MASTER, "--symbols", "SIMALPHA,SIMBETA", "--daily-days", "90", "--intraday-days", "45")
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert "SIMALPHA=" in out and "SIMBETA=" in out and "SIMGAMMA" not in out
+
+
 def _verify(cli, capsys, sec=900001):
     assert cli("verify-api", "--symbol", "SIMALPHA", "--security-id", str(sec)) == 0
     return capsys.readouterr().out
