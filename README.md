@@ -12,9 +12,10 @@ reference. A file records its timeframe and refuses to be opened as the other on
 Scope is equity history only (no options, expiries or Greeks).
 
 > **Status:** the code is complete and unit/integration-tested against a *synthetic local server*. It has **not yet been
-> run against the live Dhan API or checked against NSE records** (the build environment had no access). See
-> [Status of API assumptions](#status-of-api-assumptions) and [docs/CORPORATE_ACTIONS.md](docs/CORPORATE_ACTIONS.md).
-> Do not start a full-universe download until the live checks below have passed.
+> run against the live Dhan API or checked against NSE records** (the cloud session had no credentials and no network
+> route to Dhan/NSE). See [Status of API assumptions](#status-of-api-assumptions) and
+> [docs/CORPORATE_ACTIONS.md](docs/CORPORATE_ACTIONS.md). Do not start a full-universe download until the live checks
+> have passed.
 
 ## Setup
 
@@ -99,21 +100,39 @@ DuckDB allows one writer per file, so `report`/`status` cannot open a file while
 
 ## Status of API assumptions
 
-The official Dhan documentation pages were not reachable when this was built; the official `dhanhq` 2.3.0 SDK source
-and its release notes were. `python -m stockdata verify-api` runs controlled live probes for everything marked *not confirmed*.
+**Live verification against real Dhan data: NOT YET RUN.** It was blocked because the session had no credentials
+(`.env` is git-ignored, so it never reaches a cloud checkout) and the network policy rejected Dhan and NSE hosts.
+Nothing below was confirmed by a live call.
 
-| Item | Basis | Status |
-|---|---|---|
-| Endpoints, request fields, `interval` values 1/5/15/25/60, `NSE_EQ`, `access-token` header | SDK 2.3.0 source | confirmed in SDK; not live |
-| Unix-epoch timestamps (v2 moved from "Julian" to epoch); daily candle = midnight IST | SDK source + v2.0.0 release notes | confirmed in SDK; **not live**; runtime validation fails any mismatch |
-| 90-day maximum per intraday request | task brief | **not confirmed**; default is 89 days, hard cap 90 |
-| Exclusive daily `toDate` | task brief | **not confirmed**; validation fails any window containing a candle on `toDate` |
-| Five years of intraday history | Dhan support page (via search) | not confirmed live |
-| Intraday date format (`YYYY-MM-DD HH:MM:SS` vs `YYYY-MM-DD`) | SDK docstring says date only | **not confirmed**; `DHAN_INTRADAY_DATE_FORMAT`; windows are midnight-aligned so either works |
-| Rate limit (assumed 5 req/s) | recollection | **not confirmed**; default 3 req/s |
-| Instrument-master columns / equity filter | recollection | **not confirmed**; parser fails loudly, `instruments summary` shows the truth |
-| Error codes (DH-9xx) and how an empty window is signalled | recollection | **not confirmed**; unknown codes fail the window |
-| Whether Dhan's candles are raw or split/bonus-adjusted | — | **unknown**; see corporate actions |
+### Documentation-confirmed
+
+Confirmed by the maintainer's review of the official Dhan documentation (2026-10-10). The build environment could not
+fetch the documentation itself, so these were *recorded as instructed*, not independently re-read.
+
+| Documented fact | How the implementation uses it |
+|---|---|
+| Daily historical data is available from instrument inception | request floor is `DAILY_HISTORY_START` = 1990-01-01; pre-listing windows are expected to be empty. Whether one 1990→today request is accepted is **not** documented and is a live check |
+| Daily `toDate` is exclusive | the window end is sent unchanged as `toDate`; validation still fails any window that contains a candle dated `toDate` |
+| Intraday intervals include 15 minutes; up to five years of history; maximum 90-day request window | `interval = 15`; windows of 89 days (hard cap 90); history start = five years before the first run, then pinned |
+| Historical Data APIs: 5 requests/second and 100,000 requests/day | default 3 requests/second (never above 5). **The 100,000/day cap is not enforced in code**: it is account-wide, shared by both downloaders, and retries count. Use `download --dry-run` to count a run's requests first |
+| Official compact and detailed instrument-master CSV URLs | `config.MASTER_URLS` (the same two URLs appear in the official SDK 2.3.0 source) |
+
+Also seen in the official SDK 2.3.0 source (a client library, not the API page): endpoint paths, request field names,
+`interval` values 1/5/15/25/60, the `NSE_EQ` segment, the `access-token` header, and Unix-epoch → IST conversion.
+
+### Still requires live verification
+
+`python -m stockdata verify-api` and `selfcheck` are built to settle these; until they have run, they stay unconfirmed.
+
+| Behaviour | Why it is not settled |
+|---|---|
+| **Intraday boundary behaviour**: whether exactly 90 days is accepted, whether 91 is rejected, how `fromDate`/`toDate` are treated at midnight, the accepted date format (`YYYY-MM-DD HH:MM:SS` vs `YYYY-MM-DD`) | documentation gives only the 90-day maximum; windows are midnight-aligned and 89 days long so the defaults do not depend on the answer |
+| Bar timestamp convention (bar start vs end) and the actual epoch values (daily = midnight IST?) | only seen in the SDK; the validator fails any window whose candles fall outside the requested range or off the 09:15 + 15-minute grid |
+| **Instrument-master rows for NSE cash equities**: real column names, the `EXCH_ID`/`SEGMENT`/`INSTRUMENT`/`SERIES` values, ETFs and other series, duplicates | the CSV has never been read here; the parser fails loudly and `instruments summary` prints the real values |
+| How an empty window is signalled (empty arrays vs an error code) and the meaning of Dhan error codes (DH-9xx) | unknown codes fail the window; an error is never treated as "no data" unless opted in with `--empty-error-codes` |
+| Whether a single very long daily request is accepted | range limit for daily is not documented; `--window-days` controls it |
+| Float representation of prices (e.g. 1234.5500488) | prices are stored as received (`DOUBLE`) |
+| Whether Dhan's candles are raw or split/bonus-adjusted | **unknown**; see [docs/CORPORATE_ACTIONS.md](docs/CORPORATE_ACTIONS.md) |
 
 ## Tests
 

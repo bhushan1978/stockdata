@@ -20,8 +20,8 @@ MASTER_URLS = {
 DAILY_DB_NAME = "stockdata_daily.duckdb"
 INTRADAY_DB_NAME = "stockdata_15min.duckdb"
 
-# Dhan's data-API limit is believed to be 5 requests/second; stay well below it.
-# Unverified from this build environment: confirm with `verify-api` / the docs.
+# Documented Historical Data limits: 5 requests/second and 100,000 requests/day (account-wide).
+# Stay below the per-second limit; the daily cap is not enforced here (see README).
 DEFAULT_RPS = 3.0
 
 MAX_INTRADAY_WINDOW_DAYS = 90      # hard cap: never request more than this per call
