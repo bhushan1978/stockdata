@@ -128,6 +128,38 @@ const goto = async (hash, ready) => { await page.goto(base + '/#' + hash); if (r
     check(r.status === 422, 'status ' + r.status)
   })
 
+  // ------------------------------------------------------------------ alphabet groups and multi-group selection
+  await step('Instruments: alphabet groups exist without any action and link to Historical Download', async () => {
+    await goto('/instruments', 'h2:has-text("Alphabet groups")')
+    await page.waitForSelector('.panel:has-text("Alphabet groups") a.chip')
+    const groups = await api('/groups')
+    const s = groups.find((g) => g.name === 'Alphabet S')
+    check(s && s.kind === 'alphabet' && s.count === 3, JSON.stringify(groups))
+    await page.click('.panel:has-text("Alphabet groups") a.chip:has-text("S")')
+    await page.waitForURL(/#\/download\?groups=/)
+    await page.waitForSelector('text=Alphabet groups (by the first letter')
+    check(await page.locator('label.chip.on').count() === 1, 'the letter was not preselected')
+    await shot('groups-from-instruments')
+  })
+  await step('Historical Download: several groups at once, each instrument counted once, plan previewed', async () => {
+    await api('/groups', 'POST', { name: 'My pair', security_ids: [900001, 900002] })
+    await goto('/download', 'text=1 · Dataset')
+    await page.reload(); await page.waitForSelector('text=1 · Dataset')            // a hash change alone does not reload the page's groups
+    await page.click('button:has-text("Saved groups")')
+    await page.waitForSelector('text=Your groups')
+    await page.check('label:has-text("My pair") input')
+    await page.check('label.chip:has-text("S") input')
+    await page.waitForSelector('text=2 group(s)')
+    check((await page.innerText('.panel:has(h2:has-text("Instruments"))')).includes('3'), 'the union should be 3 instruments, not 5')
+    await page.click('button:has-text("Preview Plan")')
+    await page.waitForSelector('text=planned API attempts', { timeout: 15000 })
+    check((await page.innerText('.panel:has-text("Request plan")')).includes('3 (') || (await page.innerText('.panel:has-text("Request plan")')).includes('Instruments'), 'plan')
+    await shot('groups-multi-select')
+    await page.click('button:has-text("All letters")')
+    await page.click('button:has-text("Clear")')
+    check(await page.locator('label.chip.on').count() === 0, 'clear did not clear')
+  })
+
   // ------------------------------------------------------------------ live
   await step('Live Updates: status per timeframe, separate from the historical queue', async () => {
     await goto('/live', 'h1:has-text("Live & Current Data Updates")')

@@ -26,6 +26,8 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 MAX_EXPLICIT_INSTRUMENTS = 1000          # keeps the command line far below the Windows 32,767-character limit
+MAX_GROUPS_PER_JOB = 60
+MAX_GROUP_INSTRUMENTS = 3000             # security ids a group selection may expand to (~8 characters each: far below the limit above)
 SYMBOL_RE = re.compile(r"^[A-Za-z0-9&._\-]{1,32}$")
 ERROR_CODE_RE = re.compile(r"^DH-\d{3}$")
 EARLIEST_DATE = date(1990, 1, 1)
@@ -36,6 +38,8 @@ class Selection(BaseModel):
     symbols: list[str] = Field(default_factory=list)
     security_ids: list[int] = Field(default_factory=list)
     group_id: int | None = None
+    group_ids: list[int] = Field(default_factory=list, max_length=MAX_GROUPS_PER_JOB,
+                                 description="several saved groups at once (their instruments are combined, each counted once)")
     limit: int | None = Field(default=None, ge=1, le=100_000)
 
     @field_validator("symbols")
@@ -68,9 +72,13 @@ class Selection(BaseModel):
             raise ValueError("select at least one symbol")
         if self.mode == "security_ids" and not self.security_ids:
             raise ValueError("select at least one instrument")
-        if self.mode == "group" and self.group_id is None:
-            raise ValueError("choose a saved group")
+        if self.mode == "group" and self.group_id is None and not self.group_ids:
+            raise ValueError("choose at least one saved group")
         return self
+
+    def all_group_ids(self) -> list[int]:
+        """Every selected group id, once each, in the order given."""
+        return list(dict.fromkeys(([self.group_id] if self.group_id is not None else []) + list(self.group_ids)))
 
 
 PROVIDER_NAMES = ("dhan", "fyers", "upstox")

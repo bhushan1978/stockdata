@@ -530,3 +530,66 @@ def test_what_a_run_would_do_is_previewed_from_the_real_planners_without_request
     assert [t["timeframe"] for t in plan["timeframes"]] == ["daily", "15min"] and all(t["requests"] > 0 for t in plan["timeframes"])
     assert plan["timeframes"][0]["update"]["needs_backfill"] == 1 and plan["timeframes"][0]["needs_backfill"] == ["SIMGAMMA"]
     assert dhan.log == []                                                                                    # previewing sends nothing
+
+
+class RefusesLoggedOff(FakeScheduler):
+    """Windows answers 'Access is denied' to a task that runs while logged off, unless the account may do that (SIMULATED)."""
+
+    def register(self, path, xml):
+        if "<LogonType>S4U</LogonType>" in xml:
+            raise TS.SchedulerError("could not register the scheduled task: ERROR: Access is denied.")
+        super().register(path, xml)
+
+
+class RefusesEverything(FakeScheduler):
+    def register(self, path, xml):
+        raise TS.SchedulerError("could not register the scheduled task: ERROR: Access is denied.")
+
+
+def make_service(env, backend):
+    return A.AutomationService(env.settings, env.store, env.sup, env.app.state.data, env.app.state.gate, backend=backend)
+
+
+def test_a_refused_run_when_logged_off_task_falls_back_to_signed_in_only_and_says_so(tmp_path):
+    env = Env(tmp_path)
+    try:
+        backend = RefusesLoggedOff()
+        svc = make_service(env, backend)
+        A.save_config(env.store, A.AutomationConfig(enabled=True, run_whether_logged_on=True))
+        out = svc.install()
+        assert set(backend.tasks) == {"\\StockDataMC\\Daily Update", "\\StockDataMC\\Reconciliation"}               # both tasks exist
+        assert all("<LogonType>InteractiveToken</LogonType>" in t["xml"] and "S4U" not in t["xml"] for t in backend.tasks.values())
+        assert "SIGNED IN" in out["notice"] and "Access is denied" in out["notice"] and "Run as administrator" in out["notice"]
+        assert out["config"]["run_whether_logged_on"] is False                                                        # saved settings agree with the tasks
+        assert all(t["registered"] and t["definition_current"] for t in out["tasks"])
+        again = svc.install()                                                                                          # nothing left to explain
+        assert again["notice"] is None
+    finally:
+        env.close()
+
+
+def test_a_refusal_that_is_not_about_logging_off_gives_an_actionable_message_and_changes_no_settings(tmp_path):
+    env = Env(tmp_path)
+    try:
+        svc = make_service(env, RefusesEverything())
+        A.save_config(env.store, A.AutomationConfig(enabled=True, run_whether_logged_on=True))
+        with pytest.raises(A.JobError) as e:
+            svc.install()
+        assert "Access is denied" in str(e.value) and "Run as administrator" in str(e.value) and "policy" in str(e.value)
+        assert A.load_config(env.store).run_whether_logged_on is True                                                  # the person's choice is not rewritten
+        A.save_config(env.store, A.AutomationConfig(enabled=True, run_whether_logged_on=False))
+        with pytest.raises(A.JobError, match="Run as administrator"):
+            svc.install()
+    finally:
+        env.close()
+
+
+def test_the_install_endpoint_returns_the_notice(tmp_path):
+    env = Env(tmp_path)
+    try:
+        env.app.state.automation.backend = RefusesLoggedOff()
+        A.save_config(env.store, A.AutomationConfig(enabled=True, run_whether_logged_on=True))
+        r = env.client.post("/api/automation/task/install", json={"confirm": True})
+        assert r.status_code == 200 and "SIGNED IN" in r.json()["notice"]
+    finally:
+        env.close()

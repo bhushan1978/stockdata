@@ -23,7 +23,15 @@ const fillProviderGaps = ref(false)
 const mode = ref<'all' | 'picked' | 'group'>('all')
 const picked = ref<Picked[]>([])
 const groups = ref<any[]>([])
-const groupId = ref<number | null>(null)
+const groupIds = ref<number[]>([])
+const alphaGroups = computed(() => groups.value.filter((g) => g.kind === 'alphabet'))
+const ownGroups = computed(() => groups.value.filter((g) => g.kind !== 'alphabet'))
+const pickedGroups = computed(() => groups.value.filter((g) => groupIds.value.includes(g.id)))
+// each instrument counts once even when it is in several chosen groups
+const groupInstruments = computed(() => new Set(pickedGroups.value.flatMap((g: any) => g.security_ids ?? [])).size)
+function toggleGroup(id: number) { groupIds.value = groupIds.value.includes(id) ? groupIds.value.filter((x) => x !== id) : [...groupIds.value, id] }
+function allLetters() { groupIds.value = [...new Set([...groupIds.value, ...alphaGroups.value.map((g: any) => g.id)])] }
+function noGroups() { groupIds.value = [] }
 const customRange = ref(false)
 const start = ref('')
 const end = ref('')
@@ -47,7 +55,7 @@ const draftTotal = computed(() => draft.value.reduce((a, d) => a + (d.requests ?
 const draftUnknown = computed(() => draft.value.filter((d) => d.requests === null).length)
 watch(draft, (d) => { try { sessionStorage.setItem('campaignDraft', JSON.stringify(d)) } catch { /* private mode */ } }, { deep: true })
 
-const count = computed(() => mode.value === 'all' ? null : mode.value === 'picked' ? picked.value.length : (groups.value.find((g) => g.id === groupId.value)?.count ?? 0))
+const count = computed(() => mode.value === 'all' ? null : mode.value === 'picked' ? picked.value.length : groupInstruments.value)
 const valid = computed(() => (mode.value === 'all' || (count.value ?? 0) > 0) && !repairBlock.value)
 // While a download is writing this timeframe's database the plan cannot be computed. Queueing is still allowed (the worker computes
 // the real plan when it starts, within the same limits); starting immediately is not, because the queue would hold it anyway.
@@ -62,7 +70,7 @@ const isRepair = computed(() => workMode.value !== 'download')
 // a repair names its instruments and a start date; it never covers the whole universe
 const repairBlock = computed(() => !isRepair.value ? '' : mode.value === 'all' ? 'A repair names its instruments: choose “Select symbols” or a saved group.' : !start.value ? 'A repair needs an explicit start date.' : '')
 function spec(confirmFull: boolean) {
-  const selection: any = mode.value === 'all' ? { mode: 'all' } : mode.value === 'group' ? { mode: 'group', group_id: groupId.value }
+  const selection: any = mode.value === 'all' ? { mode: 'all' } : mode.value === 'group' ? { mode: 'group', group_ids: groupIds.value }
     : { mode: 'security_ids', security_ids: picked.value.map((p) => p.security_id) }
   if (limit.value) selection.limit = limit.value
   const base: any = { timeframe: timeframe.value, provider: provider.value || null, selection, start_date: (customRange.value || isRepair.value) && start.value ? start.value : null,
@@ -70,7 +78,7 @@ function spec(confirmFull: boolean) {
   if (isRepair.value) return { ...base, kind: 'refresh', refresh_mode: workMode.value, allow_cross_provider: workMode.value === 'replace' && allowCross.value }
   return { ...base, kind: 'download', retry_failed: retryFailed.value, confirm_full: confirmFull, fill_provider_gaps: fillProviderGaps.value }
 }
-watch([timeframe, mode, picked, groupId, customRange, start, end, limit, retryFailed, scheduleOn, scheduleAt, provider, workMode, allowCross, fillProviderGaps], () => { plan.value = null; planErr.value = null }, { deep: true })
+watch([timeframe, mode, picked, groupIds, customRange, start, end, limit, retryFailed, scheduleOn, scheduleAt, provider, workMode, allowCross, fillProviderGaps], () => { plan.value = null; planErr.value = null }, { deep: true })
 watch(workMode, (m) => { if (m !== 'download') customRange.value = true })
 
 async function preview() {
@@ -126,7 +134,7 @@ async function createCampaign() {
     void router.push({ path: '/queue' })
   } catch (e) { toast(errText(e), 'error', 9000) } finally { working.value = false }
 }
-function reset() { plan.value = null; planErr.value = null; picked.value = []; mode.value = 'all'; customRange.value = false; limit.value = null; retryFailed.value = false }
+function reset() { plan.value = null; planErr.value = null; picked.value = []; groupIds.value = []; mode.value = 'all'; customRange.value = false; limit.value = null; retryFailed.value = false }
 
 async function loadProviders() {
   try { const r = await api.get('/providers'); providers.value = r.providers; defaults.value = { default: r.default, by_timeframe: r.by_timeframe ?? {} } } catch { /* the Providers screen reports it */ }
@@ -134,6 +142,8 @@ async function loadProviders() {
 onMounted(async () => {
   await Promise.all([loadGroups(), loadProviders()])
   if (route.query.tf === 'daily' || route.query.tf === '15min') timeframe.value = route.query.tf
+  const qGroups = String(route.query.groups ?? '').split(',').map((s) => parseInt(s)).filter(Boolean)
+  if (qGroups.length) { mode.value = 'group'; groupIds.value = qGroups.filter((id) => groups.value.some((g) => g.id === id)) }
   const ids = String(route.query.ids ?? '').split(',').map((s) => parseInt(s)).filter(Boolean).slice(0, 300)
   if (ids.length) {
     mode.value = 'picked'
@@ -189,15 +199,23 @@ const rangeText = computed(() => isRepair.value ? 'A repair covers the dates you
         </div>
 
         <div class="panel"><h2>4 · Instruments <span class="mono" style="margin-left:6px;color:var(--text)">{{ mode === 'all' ? 'entire loaded universe' : (count ?? 0) + ' selected' }}</span></h2>
-          <div class="seg" style="margin-bottom:10px"><button :class="{ on: mode === 'all' }" @click="mode = 'all'">Entire universe</button><button :class="{ on: mode === 'picked' }" @click="mode = 'picked'">Select symbols</button><button :class="{ on: mode === 'group' }" @click="mode = 'group'">Saved group</button></div>
+          <div class="seg" style="margin-bottom:10px"><button :class="{ on: mode === 'all' }" @click="mode = 'all'">Entire universe</button><button :class="{ on: mode === 'picked' }" @click="mode = 'picked'">Select symbols</button><button :class="{ on: mode === 'group' }" @click="mode = 'group'">Saved groups</button></div>
           <div v-if="mode === 'all'" class="muted">Every active instrument in the loaded master (normally the 2,351 NSE equity shares). Whole-universe jobs need an explicit confirmation before they are created.<span v-if="isRepair"> A repair cannot cover the whole universe.</span></div>
           <div v-else-if="mode === 'picked'">
             <InstrumentPicker v-model="picked" />
             <div class="row" style="margin-top:8px" v-if="picked.length"><input type="text" v-model="groupName" placeholder="Group name" style="width:180px" /><button class="small" :disabled="!groupName.trim()" @click="saveGroup">Save as group</button></div>
           </div>
           <div v-else>
-            <select v-model="groupId" style="min-width:260px"><option :value="null" disabled>Choose a group…</option><option v-for="g in groups" :key="g.id" :value="g.id">{{ g.name }} ({{ g.count }})</option></select>
-            <div v-if="!groups.length" class="muted small" style="margin-top:6px">No saved groups yet. Select symbols and use “Save as group”.</div>
+            <div class="row" style="margin-bottom:6px"><span class="muted small">Choose one or more groups; an instrument in several chosen groups is downloaded once.</span><span class="grow"></span>
+              <button class="small" :disabled="!alphaGroups.length" @click="allLetters">All letters</button><button class="small ghost" :disabled="!groupIds.length" @click="noGroups">Clear</button></div>
+            <div v-if="alphaGroups.length"><div class="muted small" style="margin-bottom:4px">Alphabet groups (by the first letter of the symbol; kept up to date from the instrument master)</div>
+              <div class="chips">
+                <label v-for="g in alphaGroups" :key="g.id" class="chip" :class="{ on: groupIds.includes(g.id) }" style="cursor:pointer;padding:2px 10px" :title="g.name + ': ' + g.count + ' instruments'">
+                  <input type="checkbox" :checked="groupIds.includes(g.id)" @change="toggleGroup(g.id)" style="margin-right:5px" /><b>{{ g.name.replace('Alphabet ', '') }}</b><span class="muted small">&nbsp;{{ g.count }}</span></label></div></div>
+            <div v-if="ownGroups.length" style="margin-top:10px"><div class="muted small" style="margin-bottom:4px">Your groups</div>
+              <label v-for="g in ownGroups" :key="g.id" class="inline" style="display:flex;margin-bottom:2px"><input type="checkbox" :checked="groupIds.includes(g.id)" @change="toggleGroup(g.id)" /> {{ g.name }} <span class="muted small">({{ g.count }})</span></label></div>
+            <div v-if="!groups.length" class="muted small" style="margin-top:6px">No groups yet. Load the instrument master (Instruments page) to get the alphabet groups, or select symbols and use “Save as group”.</div>
+            <div v-else-if="groupIds.length" class="small" style="margin-top:8px"><b>{{ groupIds.length }}</b> group(s) · <b class="mono">{{ num(groupInstruments) }}</b> instrument(s)</div>
           </div>
         </div>
 

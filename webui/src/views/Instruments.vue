@@ -23,6 +23,18 @@ const data = ref<any>(null)
 const selected = ref<Set<any>>(new Set())
 const refreshOpen = ref(false)
 const masterKind = ref<'compact' | 'detailed'>('compact')
+const groups = ref<any[]>([])
+const alphaGroups = computed(() => groups.value.filter((g) => g.kind === 'alphabet'))
+const groupBusy = ref(false)
+async function loadGroups() { try { groups.value = await api.get('/groups') } catch { groups.value = [] } }
+async function rebuildGroups() {
+  groupBusy.value = true
+  try {
+    const r = await api.post('/groups/alphabet', {})
+    toast(r.changed ? `Alphabet groups updated: ${r.created.length} created, ${r.updated.length} changed, ${r.removed.length} removed` : 'The alphabet groups already match the instrument master', 'ok', 5000)
+    await loadGroups()
+  } catch (e) { toast(errText(e), 'error', 8000) } finally { groupBusy.value = false }
+}
 const working = ref(false)
 const err = ref('')
 const lastMaster = ref<any>(null)
@@ -65,7 +77,7 @@ async function refreshMaster() {
   } catch (e) { toast(errText(e), 'error', 9000) } finally { working.value = false }
 }
 const withData = (r: InstrumentRow, k: 'daily' | 'intraday') => (r[k]?.candles ?? 0) > 0
-onMounted(() => { if (route.query.q) void refresh() })
+onMounted(() => { void loadGroups(); if (route.query.q) void refresh() })
 </script>
 
 <template>
@@ -81,6 +93,16 @@ onMounted(() => { if (route.query.q) void refresh() })
         <div class="sub" v-if="master">loaded {{ ago(master.loaded_at_utc) }} · {{ ist(master.loaded_at_utc) }}</div><div class="sub" v-else>not loaded yet</div></div>
       <div class="panel tile" style="grid-column: span 3"><h2>Master source</h2><div class="small" v-if="master"><div>{{ master.universe }}</div><div class="muted">{{ master.source }} · {{ num(master.rows_total) }} master rows · {{ num(master.rows_in_universe) }} in the configured universe</div></div>
         <div class="small muted" v-else>Use “Refresh instrument master” to fetch Dhan's public instrument CSV and load the configured universe (config/universe.toml) into both databases.</div></div>
+    </div>
+
+    <div class="panel" v-if="alphaGroups.length || data?.universe_total">
+      <div class="row"><h2 style="margin:0">Alphabet groups</h2><span class="muted small">built automatically from the first letter of each symbol and kept in step with the instrument master</span>
+        <span class="grow"></span><button class="small" :disabled="groupBusy" title="Rebuild from the loaded master now (they are also updated by themselves when the master changes)" @click="rebuildGroups">Rebuild</button></div>
+      <div class="chips" style="margin-top:8px" v-if="alphaGroups.length">
+        <RouterLink v-for="g in alphaGroups" :key="g.id" class="chip" style="padding:2px 10px;text-decoration:none" :to="{ path: '/download', query: { groups: String(g.id) } }" :title="'Open Historical Download with ' + g.name + ' selected (' + g.count + ' instruments)'">
+          <b>{{ g.name.replace('Alphabet ', '') }}</b><span class="muted small">&nbsp;{{ g.count }}</span></RouterLink></div>
+      <div class="small muted" style="margin-top:6px" v-if="alphaGroups.length">Click a letter to start a download for it, or choose several groups at once on <RouterLink to="/download">Historical Download → Saved groups</RouterLink>.</div>
+      <div class="small muted" v-else>No groups yet: press Rebuild once the instrument master is loaded.</div>
     </div>
 
     <div class="panel" v-if="lastMaster">

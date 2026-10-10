@@ -16,6 +16,7 @@ running application ("Run now"). Which one is decided by whether an application 
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -446,22 +447,43 @@ class AutomationService:
     # ---------------------------------------------------------------------------------- management
     def install(self) -> dict:
         cfg = load_config(self.store)
-        installed = []
-        for spec in self.specs(cfg):
-            xml = TS.build_task_xml(spec)
+        installed: list[str] = []
+        notice: str | None = None
+        specs = self.specs(cfg)
+        i = 0
+        while i < len(specs):
+            spec = specs[i]
             try:
-                self.backend.register(TS.task_path(spec.phase), xml)
+                self.backend.register(TS.task_path(spec.phase), TS.build_task_xml(spec))
             except TS.SchedulerError as exc:
-                raise JobError(str(exc), 400)
+                if spec.run_whether_logged_on and notice is None and self._interactive_task_registers(spec):
+                    # Windows lets only an administrator (or an account holding the "Log on as a batch job" right) create a task
+                    # that runs while nobody is signed in. Fall back to the task that runs while YOU are signed in, say so, and
+                    # remember it so the saved settings and the installed task agree.
+                    cfg = cfg.model_copy(update={"run_whether_logged_on": False})
+                    save_config(self.store, cfg)
+                    notice = TS.LOGGED_OFF_REFUSED.replace("{detail}", str(exc))
+                    specs, installed, i = self.specs(cfg), [], 0
+                    continue
+                raise JobError(TS.explain_register_failure(str(exc)), 400)
             installed.append(spec.phase)
+            i += 1
         if not cfg.reconcile_enabled:                              # a switched-off reconciliation must not linger as a task
             try:
                 if self.backend.available and self.backend.info(TS.task_path("reconcile")):
                     self.backend.unregister(TS.task_path("reconcile"))
             except TS.SchedulerError:
                 pass
-        self.store.audit("automation.task.install", None, {"tasks": installed})
-        return self.status()
+        self.store.audit("automation.task.install", None, {"tasks": installed, "signed_in_only_fallback": notice is not None})
+        return {**self.status(), "notice": notice}
+
+    def _interactive_task_registers(self, spec: TS.TaskSpec) -> bool:
+        """Would the same task, running only while the user is signed in, be accepted? (Registers it if so.)"""
+        try:
+            self.backend.register(TS.task_path(spec.phase), TS.build_task_xml(dataclasses.replace(spec, run_whether_logged_on=False)))
+            return True
+        except TS.SchedulerError:
+            return False
 
     def remove(self) -> dict:
         for phase in TS.TASKS:

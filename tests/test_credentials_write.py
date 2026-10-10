@@ -8,7 +8,7 @@ import pytest
 
 from stockdata.web import credentials as C
 from stockdata.web.credentials import CredentialFileError, CredentialStore
-from web_helpers import Env, UI  # noqa: F401
+from web_helpers import CLIENT_KEY, Env, TOKEN_KEY, UI  # noqa: F401
 
 TOKEN = "canary-token-abcdef123456"
 
@@ -42,31 +42,31 @@ def test_a_replace_that_is_refused_for_a_moment_is_retried_and_then_succeeds(sto
     calls = refuse(monkeypatch, times=2)
     store.update(access_token=TOKEN, client_id="1000000001")
     assert calls["n"] == 3
-    assert f"DHAN_ACCESS_TOKEN={TOKEN}" in (tmp_path / ".env").read_text() and strays(tmp_path) == []
-    assert store.environ["DHAN_ACCESS_TOKEN"] == TOKEN
+    assert f"{TOKEN_KEY}={TOKEN}" in (tmp_path / ".env").read_text() and strays(tmp_path) == []
+    assert store.environ[TOKEN_KEY] == TOKEN
 
 
 def test_the_read_only_flag_is_cleared_when_it_is_what_blocks_the_replace(store, tmp_path, monkeypatch):
-    (tmp_path / ".env").write_text("DHAN_CLIENT_ID=1000000001\n")
+    (tmp_path / ".env").write_text(f"{CLIENT_KEY}=1000000001\n")
     seen = []
     monkeypatch.setattr(CredentialStore, "_make_writable", staticmethod(lambda p: seen.append(str(p))))
     refuse(monkeypatch, times=3)
     store.update(access_token=TOKEN)
-    assert seen == [str(tmp_path / ".env")] and f"DHAN_ACCESS_TOKEN={TOKEN}" in (tmp_path / ".env").read_text()
+    assert seen == [str(tmp_path / ".env")] and f"{TOKEN_KEY}={TOKEN}" in (tmp_path / ".env").read_text()
 
 
 def test_when_the_file_can_never_be_replaced_it_is_overwritten_in_place_and_nothing_else_in_it_is_lost(store, tmp_path, monkeypatch):
-    (tmp_path / ".env").write_text("# my notes\nSTOCKDATA_RPS=2\nDHAN_CLIENT_ID=1000000001\n")
+    (tmp_path / ".env").write_text(f"# my notes\nSTOCKDATA_RPS=2\n{CLIENT_KEY}=1000000001\n")
     calls = refuse(monkeypatch, times=None)
     store.update(access_token=TOKEN)
     assert calls["n"] == len(C.REPLACE_RETRY_DELAYS)
     text = (tmp_path / ".env").read_text()
-    assert "# my notes" in text and "STOCKDATA_RPS=2" in text and "DHAN_CLIENT_ID=1000000001" in text and f"DHAN_ACCESS_TOKEN={TOKEN}" in text
-    assert strays(tmp_path) == [] and store.environ["DHAN_ACCESS_TOKEN"] == TOKEN
+    assert "# my notes" in text and "STOCKDATA_RPS=2" in text and f"{CLIENT_KEY}=1000000001" in text and f"{TOKEN_KEY}={TOKEN}" in text
+    assert strays(tmp_path) == [] and store.environ[TOKEN_KEY] == TOKEN
 
 
 def test_a_file_that_cannot_be_written_at_all_gives_a_clear_message_without_the_secret_and_changes_nothing(store, tmp_path, monkeypatch):
-    (tmp_path / ".env").write_text("DHAN_CLIENT_ID=1000000001\n")
+    (tmp_path / ".env").write_text(f"{CLIENT_KEY}=1000000001\n")
     refuse(monkeypatch, times=None)
 
     def locked(dest, text):
@@ -76,13 +76,13 @@ def test_a_file_that_cannot_be_written_at_all_gives_a_clear_message_without_the_
     with pytest.raises(CredentialFileError) as e:
         store.update(access_token=TOKEN)
     assert "could not be replaced or written" in str(e.value) and TOKEN not in str(e.value) and ".env" in str(e.value)
-    assert (tmp_path / ".env").read_text() == "DHAN_CLIENT_ID=1000000001\n"            # untouched
-    assert "DHAN_ACCESS_TOKEN" not in store.environ and strays(tmp_path) == []          # and not claimed as saved
+    assert (tmp_path / ".env").read_text() == f"{CLIENT_KEY}=1000000001\n"            # untouched
+    assert TOKEN_KEY not in store.environ and strays(tmp_path) == []          # and not claimed as saved
 
 
 def test_a_write_that_fails_half_way_restores_the_previous_content(tmp_path, monkeypatch):
     dest = tmp_path / ".env"
-    dest.write_text("DHAN_CLIENT_ID=1000000001\n")
+    dest.write_text(f"{CLIENT_KEY}=1000000001\n")
     real_open = open
 
     def flaky(path, mode="r", *a, **k):
@@ -98,9 +98,9 @@ def test_a_write_that_fails_half_way_restores_the_previous_content(tmp_path, mon
 
     monkeypatch.setattr("builtins.open", flaky)
     with pytest.raises(OSError):
-        CredentialStore._overwrite_in_place(dest, "DHAN_CLIENT_ID=9999999999\nDHAN_ACCESS_TOKEN=x\n")
+        CredentialStore._overwrite_in_place(dest, f"{CLIENT_KEY}=9999999999\n{TOKEN_KEY}=x\n")
     monkeypatch.undo()
-    assert dest.read_text() == "DHAN_CLIENT_ID=1000000001\n"
+    assert dest.read_text() == f"{CLIENT_KEY}=1000000001\n"
 
 
 def test_the_api_reports_a_locked_credentials_file_as_a_clear_409_not_an_internal_error(tmp_path, monkeypatch):
@@ -110,7 +110,7 @@ def test_the_api_reports_a_locked_credentials_file_as_a_clear_409_not_an_interna
         refuse(monkeypatch, times=None)
         monkeypatch.setattr(CredentialStore, "_overwrite_in_place", staticmethod(lambda d, t: (_ for _ in ()).throw(PermissionError(5, "denied"))))
         for method, url, body in (("put", "/api/credentials", {"access_token": TOKEN}),
-                                  ("put", "/api/providers/dhan/credentials", {"values": {"DHAN_ACCESS_TOKEN": TOKEN}})):
+                                  ("put", "/api/providers/dhan/credentials", {"values": {TOKEN_KEY: TOKEN}})):
             r = getattr(env.client, method)(url, json=body)
             assert r.status_code == 409 and "could not be replaced or written" in r.json()["error"], (url, r.status_code, r.text)
             assert "Internal error" not in r.text and TOKEN not in r.text

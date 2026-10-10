@@ -50,7 +50,7 @@ CREATE INDEX IF NOT EXISTS job_events_job ON job_events(job_id, id);
 CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, action TEXT NOT NULL, subject TEXT, details TEXT);
 CREATE TABLE IF NOT EXISTS symbol_groups (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, security_ids TEXT NOT NULL, created_at TEXT NOT NULL);
+    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, security_ids TEXT NOT NULL, created_at TEXT NOT NULL, kind TEXT);
 CREATE TABLE IF NOT EXISTS cache (
     key TEXT PRIMARY KEY, value TEXT NOT NULL, fingerprint TEXT, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS provider_checks (
@@ -88,6 +88,9 @@ class Store:
         for col, ddl in (("provider", "TEXT"), ("lane", "TEXT"), ("yielded_to", "INTEGER")):    # v2 -> v3: workflows and providers
             if col not in cols:
                 self.execute(f"ALTER TABLE jobs ADD COLUMN {col} {ddl}")
+        group_cols = {r["name"] for r in self.all("PRAGMA table_info(symbol_groups)")}
+        if "kind" not in group_cols:                              # additive: NULL = a group a person made, 'alphabet' = automatic
+            self.execute("ALTER TABLE symbol_groups ADD COLUMN kind TEXT")
         self.set_meta("schema_version", SCHEMA_VERSION)
 
     def close(self) -> None:

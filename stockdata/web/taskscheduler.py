@@ -176,6 +176,20 @@ class SchedulerError(RuntimeError):
     """The Task Scheduler refused or could not be reached (the message is safe to show)."""
 
 
+LOGGED_OFF_REFUSED = ("Windows refused to create a task that runs while you are logged off ({detail}). That needs an administrator "
+                      "or the \"Log on as a batch job\" right. The tasks were created to run while you are SIGNED IN instead, and "
+                      "\"Run even when I am logged off\" has been switched off. To run when logged off, start the application once "
+                      "with \"Run as administrator\" and tick it again.")
+
+
+def explain_register_failure(message: str) -> str:
+    """The Task Scheduler's own message plus what usually fixes a refusal (it is shown in the language of the PC's Windows)."""
+    return (f"{message}. Windows may be refusing your account to create scheduled tasks. Close the application, start "
+            "start_stockdata.bat with \"Run as administrator\" once, and press Install again; if your PC is managed by an "
+            "organisation, its policy may forbid scheduled tasks (then use the Run now button, or ask your administrator). "
+            "The task is only created for the StockDataMC folder and runs this application's own scripts.")
+
+
 class SchedulerBackend:
     available = False
     name = "none"

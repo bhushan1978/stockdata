@@ -293,10 +293,16 @@ class Supervisor:
                 raise JobError(f"symbols not in the loaded universe: {', '.join(missing[:10])}", 400)
             return None
         if sel.mode == "group":
-            grp = self.store.one("SELECT * FROM symbol_groups WHERE id = ?", (sel.group_id,))
-            if not grp:
-                raise JobError(f"saved group {sel.group_id} does not exist", 404)
-            ids = json.loads(grp["security_ids"])
+            ids = []
+            for gid in sel.all_group_ids():
+                grp = self.store.one("SELECT * FROM symbol_groups WHERE id = ?", (gid,))
+                if not grp:
+                    raise JobError(f"saved group {gid} does not exist", 404)
+                ids.extend(json.loads(grp["security_ids"]))
+            ids = list(dict.fromkeys(ids))                                        # an instrument in two groups is requested once
+            if len(ids) > J.MAX_GROUP_INSTRUMENTS:
+                raise JobError(f"the selected groups hold {len(ids):,} instruments; at most {J.MAX_GROUP_INSTRUMENTS:,} can be named in one "
+                               "job. Choose fewer groups, or use the entire universe.", 400)
         else:
             ids = sel.security_ids
         missing_ids = [i for i in ids if i not in by_id]

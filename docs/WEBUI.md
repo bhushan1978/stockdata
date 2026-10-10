@@ -53,6 +53,10 @@ it refuses any other `--host`.
    Check the plan (2,351 requests expected for daily; resolved start 1990-01-01, exclusive end, budget, disk, warnings).
 3. **Add to Queue** (or **Start Now**) → tick the confirmation. Repeat for **15-minute candles** (≈49,371 requests), or use
    *Create full-history campaign…* to queue both so the 15-minute job starts only after the daily job completes.
+   For a big universe use **Saved groups**: the **alphabet groups** (`Alphabet A` ... `Alphabet Z`, `Alphabet 0-9`, `Alphabet other`) are built
+   automatically from the first letter of each symbol and kept in step with the instrument master (**Instruments → Alphabet groups**,
+   *Rebuild* to refresh them now). Tick several groups (or *All letters*); an instrument in more than one chosen group is downloaded once,
+   and a job can name up to 3,000 instruments this way. Your own groups (**Select symbols → Save as group**) appear beside them.
 4. Watch **Job Queue** (progress is completed windows out of planned windows) and **Activity & Logs** (current instrument and
    window, attempts, retries, heartbeat, log tail).
 5. Use **Pause** whenever you want to stop for the day, **Resume** later. After both finish: **Data Quality → Run checks**
@@ -133,6 +137,10 @@ worker. A program outside this application holding a database file is reported a
   "Invalid Token". The run stops at once (one request spent, nothing recorded as failed). Generate a new token in the Dhan console,
   paste it on **Providers** (or Settings → General) together with the client id of the *same* account, press *Test connection*, then
   **Resume**. A token that has not expired can still be invalid if a newer one was generated, or if the client id belongs to another account.
+* **Installing the scheduled tasks says "Access is denied"** (Windows) — "Run even when I am logged off" needs administrator rights on most
+  PCs. The application then installs the tasks to run while you are signed in and tells you. For the logged-off variant, start
+  `start_stockdata.bat` with *Run as administrator* once. If even the signed-in tasks are refused, your PC's policy may forbid scheduled
+  tasks; use *Run daily update now* or ask your administrator.
 * **Saving credentials fails with "The credentials file ... could not be replaced or written"** (Windows) — another program has `.env`
   open (an editor, antivirus, OneDrive/backup sync) or the file is read-only. The application retries, clears a read-only flag, repairs
   its own permissions and finally overwrites in place; if the message still appears, close the program holding the file or run

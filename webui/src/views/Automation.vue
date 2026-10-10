@@ -47,6 +47,7 @@ async function save() {
 // ---- Task Scheduler actions
 type TaskAction = 'install' | 'remove' | 'enable' | 'disable'
 const taskAsk = ref<TaskAction | null>(null)
+const installNotice = ref('')
 const TASK_TEXT: Record<TaskAction, string> = {
   install: 'Creates (or updates) the two scheduled tasks under \\StockDataMC in the current user\'s Windows Task Scheduler. The task command contains only paths and the phase name — no credential.',
   remove: 'Deletes the StockDataMC scheduled tasks. Stored candles, the request ledger and checkpoints are not touched.',
@@ -56,7 +57,12 @@ const TASK_TEXT: Record<TaskAction, string> = {
 async function doTask() {
   const a = taskAsk.value; if (!a) return
   working.value = true
-  try { await api.post(`/automation/task/${a}`, { confirm: true }); toast(`Scheduled tasks: ${a} done`, 'ok'); taskAsk.value = null; await refresh() }
+  try {
+    const r = await api.post(`/automation/task/${a}`, { confirm: true })
+    installNotice.value = a === 'install' ? (r?.notice ?? '') : ''
+    toast(`Scheduled tasks: ${a} done${installNotice.value ? ' (with a change: see the notice)' : ''}`, installNotice.value ? 'info' : 'ok', 7000)
+    taskAsk.value = null; await refresh()
+  }
   catch (e) { toast(errText(e), 'error', 10000); taskAsk.value = null } finally { working.value = false }
 }
 
@@ -144,6 +150,7 @@ const unattended = computed(() => (providers.value ?? []).filter((p) => cfg.prov
         <span v-if="dirty" class="warn small">Unsaved changes</span>
       </div>
 
+      <Banner v-if="installNotice" kind="warn"><b>The tasks were installed with a change.</b> {{ installNotice }} <a href="#" @click.prevent="installNotice = ''">dismiss</a></Banner>
       <div class="panel"><h2>Windows Task Scheduler <span class="badge" :class="available ? 'b-ok' : 'b-unavailable'">{{ available ? st.scheduler.backend : 'unavailable' }}</span></h2>
         <table class="t"><thead><tr><th>Task</th><th>Registered</th><th>State</th><th>Next run</th><th>Last run</th><th>Last result</th><th></th></tr></thead><tbody>
           <tr v-for="tk in tasks" :key="tk.phase"><td><b>{{ taskLabel[tk.phase] }}</b><div class="mono small muted">{{ tk.task }}</div><div class="small muted">at {{ tk.time_ist }} IST</div></td>
@@ -164,7 +171,7 @@ const unattended = computed(() => (providers.value ?? []).filter((p) => cfg.prov
           <button :disabled="!cfg.reconcile_enabled" @click="openRun('reconcile')">Run reconciliation now…</button>
         </div>
         <div class="row small" style="margin-top:10px">
-          <label class="inline"><input type="checkbox" v-model="cfg.run_whether_logged_on" @change="dirty = true" /> Run even when I am logged off <span class="muted">(Windows then needs your password to store the task; leave off to run only while you are signed in)</span></label>
+          <label class="inline"><input type="checkbox" v-model="cfg.run_whether_logged_on" @change="dirty = true" /> Run even when I am logged off <span class="muted">(needs administrator rights on most PCs; if Windows refuses, the tasks are installed to run while you are signed in and this box is switched off)</span></label>
           <label class="inline"><input type="checkbox" v-model="cfg.wake_to_run" @change="dirty = true" /> Wake the computer to run</label>
         </div>
         <div class="small muted" style="margin-top:6px">The task starts <span class="mono">pythonw.exe -m stockdata.web automation run …</span> with only paths and the phase name on its command line. Missed runs start when the computer is next available; an overlapping start is ignored (never run twice at once); the schedule is anchored to Asia/Kolkata whatever the PC's time zone, and daylight-saving changes cannot shift it.

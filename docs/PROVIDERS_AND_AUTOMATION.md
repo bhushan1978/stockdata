@@ -148,7 +148,11 @@ Two tasks are created under `\StockDataMC`: **Daily Update** (post-close, defaul
   because an update is incremental from the last stored candle, a late run simply catches up the missed days;
 * `MultipleInstancesPolicy=IgnoreNew`, `RunOnlyIfNetworkAvailable`, an execution time limit (default 6 h);
 * run only while you are signed in (`InteractiveToken`, the default and needing no password) — or *Run even when I am logged off*
-  (`S4U`, which Windows may require your account password for);
+  (`S4U`). Windows normally lets only an administrator (or an account with the "Log on as a batch job" right) create that kind of task:
+  when it answers "Access is denied", **Install** falls back to the signed-in-only tasks, switches the box off and says so on screen
+  (the saved settings and the installed tasks then agree). To run when logged off, start `start_stockdata.bat` once with *Run as
+  administrator*, tick the box and install again. Any other refusal (for example a company policy that forbids scheduled tasks) is shown
+  with the same advice; *Run daily update now* still works;
 * optional *Wake the computer to run*.
 
 Installing, inspecting, enabling, disabling and removing the tasks, "Run now", next/last run, last result, last success, missed

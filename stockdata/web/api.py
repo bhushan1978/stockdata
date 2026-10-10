@@ -29,6 +29,7 @@ from stockdata.web.data import DataAccess, DatabaseBusy, DatabaseMissing, DbGate
 from stockdata.web.maintenance import Maintenance
 from stockdata.providers import PROVIDER_NAMES, get_provider
 from stockdata.web.corporate import CorporateActions
+from stockdata.web.groups import PREFIX as ALPHABET_PREFIX, list_groups, sync_alphabet_groups
 from stockdata.web.automation import AutomationConfig, AutomationService, load_config, save_config
 from stockdata.web.providers import ProviderService
 from stockdata.web.system import SystemInfo
@@ -632,14 +633,28 @@ def create_app(settings: WebSettings, *, start_scheduler: bool = True) -> FastAP
     # ---- groups
     @app.get("/api/groups", tags=["data"])
     def api_groups() -> list[dict]:
-        import json as _json
-        return [{"id": g["id"], "name": g["name"], "count": len(_json.loads(g["security_ids"])), "security_ids": _json.loads(g["security_ids"]),
-                 "created_at": g["created_at"]} for g in store.all("SELECT * FROM symbol_groups ORDER BY name")]
+        """Saved groups. The automatic ALPHABET groups are brought up to date from the loaded master first (cheap and a no-op when
+        the master has not changed), so they exist as soon as an instrument master is loaded."""
+        try:
+            sync_alphabet_groups(store, data.instrument_master().get("rows", []))
+        except Exception:                                     # noqa: BLE001 - listing the groups must never fail because of the sync
+            log.exception("alphabet group sync failed")
+        return list_groups(store)
+
+    @app.post("/api/groups/alphabet", tags=["data"])
+    def api_alphabet_groups() -> dict:
+        """Rebuild the automatic alphabet groups from the loaded instrument master now."""
+        rows = data.instrument_master().get("rows", [])
+        if not rows:
+            raise JobError("No instrument universe is loaded yet. Load the instrument master first (Instruments page).", 400)
+        return sync_alphabet_groups(store, rows, force=True)
 
     @app.post("/api/groups", tags=["data"])
     def api_create_group(body: GroupIn) -> dict:
         import json as _json
         from stockdata.web.store import now
+        if body.name.strip().lower().startswith(ALPHABET_PREFIX.lower()):
+            raise JobError(f"names starting with {ALPHABET_PREFIX.strip()!r} are reserved for the automatic groups", 400)
         master = {r["security_id"] for r in data.instrument_master().get("rows", [])}
         unknown = [i for i in body.security_ids if i not in master]
         if unknown:
@@ -654,6 +669,9 @@ def create_app(settings: WebSettings, *, start_scheduler: bool = True) -> FastAP
 
     @app.delete("/api/groups/{group_id}", tags=["data"])
     def api_delete_group(group_id: int) -> dict:
+        row = store.one("SELECT kind FROM symbol_groups WHERE id = ?", (group_id,))
+        if row and row["kind"] == "alphabet":
+            raise JobError("This is an automatic alphabet group: it is rebuilt from the instrument master and cannot be deleted.", 400)
         store.execute("DELETE FROM symbol_groups WHERE id = ?", (group_id,))
         store.audit("group.delete", f"group:{group_id}", {})
         return {"deleted": group_id}
