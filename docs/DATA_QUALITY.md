@@ -54,6 +54,11 @@ For RELIANCE, TCS and INFY the number of bars per session depends on the date:
 * **Negative volume exists**: Saturday 2022-04-09 12:45, one bar per symbol (RELIANCE -35,067,964, followed by +52,148,702 in the
   next bar), consistent with volume derived from a cumulative counter that stepped backwards. Stored as received
   (`negative_volume`).
+* **A response can repeat a candle key** (seen live: WELSPUNLIV, daily, 1990 to today: one repeated date). Identical copies are collapsed to one
+  (`duplicate_dropped`, nothing lost). *Different* candles for the same date or time are **not stored and never merged or guessed**: the date
+  shows up as a gap, the rest of the response is stored, and every raw row is written into the `duplicate_conflict` flag so you can decide
+  (Data Quality → Flagged candles). More than 5 such keys in one response is treated as a time-base problem and the whole window fails.
+  Instruments whose window failed earlier with `duplicate_timestamps` need *Retry failed windows* after this change: a plain rerun skips them.
 * **"No data" is signalled differently per endpoint**: intraday returns HTTP 200 with empty arrays; daily returns `HTTP 400 DH-907`
   ("incorrect parameters or no data present"), which cannot be told apart from a bad request.
 * **History starts at Dhan's own data start**, not the exchange listing: RELIANCE 2002-01-01, INFY 2003-09-05, TCS 2004-08-25 (daily).

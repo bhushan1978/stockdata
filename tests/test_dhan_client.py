@@ -111,3 +111,24 @@ def test_token_refused_over_plain_http_to_a_remote_host():
         s.require_token()
     Settings(access_token="t", base_url="http://127.0.0.1:1/v2").require_token()
     Settings(access_token="t").require_token()
+
+
+TOKEN_BODY = {"errorType": "Input_Exception", "errorCode": "DH-906", "errorMessage": "Invalid Token"}
+
+
+def test_dh_906_invalid_token_is_an_authentication_failure_and_is_not_retried(fake):
+    """Seen on a real account: a rejected token comes back as HTTP 400 DH-906 'Invalid Token', not as 401/DH-901."""
+    fake.fail(times=5, status=400, body=TOKEN_BODY)
+    client = make_client(fake)
+    with pytest.raises(DhanAuthError) as e:
+        post(client)
+    assert e.value.http_status == 400 and e.value.error_code == "DH-906" and "Invalid Token" in e.value.message
+    assert client.requests_sent == 1 and client.sleeps == []
+
+
+def test_a_dh_906_that_does_not_name_the_token_stays_a_permanent_request_error(fake):
+    fake.fail(times=1, status=400, body={"errorType": "Order_Error", "errorCode": "DH-906", "errorMessage": "Order rejected"})
+    client = make_client(fake)
+    with pytest.raises(DhanPermanentError) as e:
+        post(client)
+    assert e.value.error_code == "DH-906" and not isinstance(e.value, DhanAuthError)

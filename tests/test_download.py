@@ -361,3 +361,14 @@ def test_selection_is_explicit_no_implicit_full_universe(env):
         select_instruments(db, symbols=["NOPE"], security_ids=None, select_all=False)
     assert len(select_instruments(db, symbols=None, security_ids=None, select_all=True)) == 3
     assert len(select_instruments(db, symbols=None, security_ids=None, select_all=True, limit=2)) == 2
+
+
+def test_a_dh_906_invalid_token_aborts_the_run_at_once_and_records_no_failed_window(daily_db, fake):
+    """Without this, every instrument would spend a request and be stored as a permanently failed window."""
+    fake.fail(times=100, status=400, body={"errorType": "Input_Exception", "errorCode": "DH-906", "errorMessage": "Invalid Token"})
+    n0 = len(fake.log)
+    stats, _ = run(daily_db, fake, DAILY)
+    assert stats["status"] == "aborted" and "authentication rejected" in stats["note"] and "DH-906" in stats["note"]
+    assert len(fake.log) - n0 == 1                                   # one request, then the run stops
+    assert daily_db.con.execute("SELECT count(*) FROM download_windows").fetchone()[0] == 0
+    assert daily_db.con.execute("SELECT count(*) FROM candles_daily").fetchone()[0] == 0

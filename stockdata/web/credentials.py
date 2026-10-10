@@ -20,6 +20,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -29,7 +30,23 @@ from stockdata.web.redact import register_secret
 from stockdata.timeutil import IST
 
 TOKEN_KEY, CLIENT_KEY = "DHAN_ACCESS_TOKEN", "DHAN_CLIENT_ID"
+# Windows refuses to replace a file that another program has open (an editor, antivirus, a sync or backup tool) for a moment,
+# so a refused replace is retried with a short back-off before anything else is tried.
+REPLACE_RETRY_DELAYS = (0.0, 0.1, 0.25, 0.5, 1.0, 2.0)
+
+
+class CredentialFileError(OSError):
+    """The credentials file could not be written. The message never contains a credential."""
 _SAFE_VALUE = re.compile(r"^[A-Za-z0-9._\-+/=]{6,4096}$")
+
+
+def _windows_account() -> str | None:
+    """DOMAIN\\user of the account running this process (qualified, so icacls resolves it on domain and local accounts alike)."""
+    user = os.environ.get("USERNAME")
+    if not user:
+        return None
+    domain = os.environ.get("USERDOMAIN")
+    return f"{domain}\\{user}" if domain else user
 
 
 def parse_env_file(path: Path) -> dict[str, str]:
@@ -73,6 +90,7 @@ class CredentialStore:
         self.env_file = Path(env_file)
         self.environ = os.environ if environ is None else environ
         self._register()
+        self._sleep = time.sleep
 
     def _file(self) -> dict[str, str]:
         return parse_env_file(self.env_file)
@@ -217,24 +235,79 @@ class CredentialStore:
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
                 fh.write(text)
             self._restrict(Path(tmp))
-            os.replace(tmp, self.env_file)
-        except Exception:
+            self._replace(Path(tmp), self.env_file, text)
+        finally:
             try:
-                os.unlink(tmp)
+                os.unlink(tmp)                       # gone already after a successful replace
             except OSError:
                 pass
-            raise
         self._restrict(self.env_file)
+
+    def _replace(self, tmp: Path, dest: Path, text: str) -> None:
+        """Move ``tmp`` over ``dest``. On Windows a refused replace is usually temporary (another program holds the file), a
+        read-only flag, or damaged permissions: retry, repair access once, and as a last resort overwrite in place."""
+        for attempt, delay in enumerate(REPLACE_RETRY_DELAYS):
+            if delay:
+                self._sleep(delay)
+            try:
+                os.replace(tmp, dest)
+                return
+            except PermissionError:
+                if attempt == 1:
+                    self._make_writable(dest)
+        try:
+            self._overwrite_in_place(dest, text)
+        except OSError:
+            where = f'"{dest}"'
+            hint = (f" Close any program that has it open (an editor, antivirus or a sync/backup tool), or clear the read-only flag "
+                    f"with:  attrib -R {where}  then save again." if sys.platform == "win32"
+                    else " Check that nothing else has it open and that it is writable, then save again.")
+            raise CredentialFileError(f"The credentials file {where} could not be replaced or written.{hint}") from None
+
+    @staticmethod
+    def _overwrite_in_place(dest: Path, text: str) -> None:
+        """Last resort when the file cannot be replaced but can still be written: not atomic, so the old content is restored
+        if the write fails half way."""
+        try:
+            before = dest.read_bytes()
+        except FileNotFoundError:
+            before = None
+        try:
+            with open(dest, "wb") as fh:
+                fh.write(text.encode("utf-8"))
+        except OSError:
+            if before is not None:
+                try:
+                    dest.write_bytes(before)
+                except OSError:
+                    pass
+            raise
+
+    @staticmethod
+    def _make_writable(path: Path) -> None:
+        """Clear a read-only flag and, on Windows, give the current user full control again (best effort; never fatal)."""
+        try:
+            os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
+        except OSError:
+            pass
+        account = _windows_account()
+        if account:
+            try:
+                subprocess.run(["icacls", str(path), "/grant:r", f"{account}:F"], capture_output=True, timeout=15, check=False)
+            except Exception:
+                pass
 
     @staticmethod
     def _restrict(path: Path) -> None:
-        """Owner-only access: chmod 600 on POSIX, an icacls grant on Windows (best effort; never fatal)."""
+        """Owner-only access: chmod 600 on POSIX; on Windows grant the current user full control FIRST and only then drop the
+        inherited permissions, so a grant that fails can never leave the file with no usable permissions (best effort)."""
         try:
             if sys.platform == "win32":
-                user = os.environ.get("USERNAME")
-                if user:
-                    subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
-                                   capture_output=True, timeout=15, check=False)
+                account = _windows_account()
+                if account:
+                    granted = subprocess.run(["icacls", str(path), "/grant:r", f"{account}:F"], capture_output=True, timeout=15, check=False)
+                    if granted.returncode == 0:
+                        subprocess.run(["icacls", str(path), "/inheritance:r"], capture_output=True, timeout=15, check=False)
             else:
                 os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
         except Exception:

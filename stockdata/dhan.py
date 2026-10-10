@@ -27,6 +27,10 @@ if TYPE_CHECKING:  # pragma: no cover
 log = logging.getLogger("stockdata.dhan")
 
 AUTH_CODES = {"DH-901", "DH-902", "DH-903"}
+# Dhan's data endpoints answer a rejected access token as HTTP 400 DH-906 "Invalid Token" (seen on a real account), although the
+# published table lists DH-906 as an order error. Only a DH-906 whose message names the token is read as an authentication
+# failure; any other DH-906 stays a permanent request error.
+TOKEN_REJECTION_CODES = {"DH-906"}
 RATE_LIMIT_CODES = {"DH-904", "DH-805"}
 TRANSIENT_CODES = {"DH-908", "DH-909"}
 
@@ -161,7 +165,7 @@ class DhanClient:
         if status == 429 or code in RATE_LIMIT_CODES:
             raise DhanTransientError(detail, http_status=status, error_code=code, rate_limited=True,
                                      retry_after=_retry_after(resp))
-        if status in (401, 403) or code in AUTH_CODES:
+        if status in (401, 403) or code in AUTH_CODES or (code in TOKEN_REJECTION_CODES and "token" in msg.lower()):
             raise DhanAuthError(detail, http_status=status, error_code=code)
         if status >= 500 or code in TRANSIENT_CODES:
             raise DhanTransientError(detail, http_status=status, error_code=code)

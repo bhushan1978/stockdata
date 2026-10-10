@@ -27,6 +27,7 @@ SESSION_CLOSE_MIN = 15 * 60 + 30
 SYSTEMATIC_FRACTION = 0.05
 SYSTEMATIC_MIN_ROWS = 20
 SYSTEMATIC_TINY_FRACTION = 0.5
+MAX_CONFLICTING_KEYS = 5        # more candle keys than this with DIFFERENT candles in one response: reject it all
 # Informational findings (a genuine special weekend session) must never make a window "systematic".
 SYSTEMATIC_KINDS = {"ohlc_relation", "non_positive_price", "negative_volume", "outside_session", "off_grid",
                     "daily_timestamp_not_midnight_ist"}
@@ -99,9 +100,7 @@ def validate_response(tf: Timeframe, body, window: Window) -> Validated:
         key = ist
     else:
         key = ist.dt.normalize()
-    if key.duplicated().any():
-        raise ValidationError("duplicate_timestamps",
-                              f"{int(key.duplicated().sum())} duplicate candle keys in one response")
+    df, ist, key, duplicate_notes = _resolve_duplicates(df, ist, key)
     outside = (key < window.start) | (key >= window.end)
     if outside.any():
         raise ValidationError(
@@ -111,6 +110,9 @@ def validate_response(tf: Timeframe, body, window: Window) -> Validated:
         )
 
     anomalies = _find_anomalies(tf, df, ist, key)
+    if len(duplicate_notes):
+        anomalies = pd.concat([anomalies, duplicate_notes], ignore_index=True)
+        anomalies["candle_key"] = anomalies["candle_key"].astype("datetime64[us]")
     flagged = anomalies.loc[anomalies["kind"].isin(SYSTEMATIC_KINDS), "candle_key"].nunique()
     n = len(df)
     systematic = (n >= SYSTEMATIC_MIN_ROWS and flagged / n > SYSTEMATIC_FRACTION) or \
@@ -125,6 +127,40 @@ def validate_response(tf: Timeframe, body, window: Window) -> Validated:
         "close": df["close"], "volume": df["volume"], "epoch_raw": df["epoch_raw"],
     }).sort_values(tf.key_col, kind="stable").reset_index(drop=True)
     return Validated(candles, anomalies, int((df["volume"] == 0).sum()))
+
+
+def _resolve_duplicates(df: pd.DataFrame, ist: pd.Series, key: pd.Series):
+    """One response can carry the same candle key more than once (seen live: WELSPUNLIV, daily, 1990 to today).
+
+    * IDENTICAL copies lose no information: one is kept and the repeat is flagged ``duplicate_dropped``.
+    * DIFFERENT candles for one key cannot be told apart (a special session, a data glitch): none of them is stored, nothing is
+      merged or guessed, each raw row is written into the flag ``duplicate_conflict`` so a person can decide, and the date shows
+      up as a visible gap. The rest of the response is stored normally.
+    * Many conflicting keys look like a time-base problem, so the whole response is rejected as before."""
+    dup = key.duplicated(keep=False)
+    if not dup.any():
+        return df, ist, key, pd.DataFrame({"candle_key": pd.Series([], dtype="datetime64[us]"), "kind": [], "detail": []})
+    keep = pd.Series(True, index=df.index)
+    notes: list[tuple] = []
+    conflicts: list = []
+    for k, grp in df[dup].groupby(key[dup], sort=True):
+        if len(grp[list(PRICE_COLS) + ["volume"]].drop_duplicates()) == 1:
+            keep[grp.index[1:]] = False
+            notes.append((k, "duplicate_dropped", f"{len(grp)} identical copies of this candle in one response; one kept"))
+        else:
+            keep[grp.index] = False
+            conflicts.append(k)
+            rows = "; ".join(f"epoch {int(r.epoch_raw)} o={r.open:g} h={r.high:g} l={r.low:g} c={r.close:g} v={int(r.volume)}"
+                             for r in grp.itertuples())
+            notes.append((k, "duplicate_conflict", f"{len(grp)} different candles for one key, none stored: {rows}"[:480]))
+    distinct = key.nunique()
+    if len(conflicts) > MAX_CONFLICTING_KEYS or len(conflicts) * 2 > distinct:
+        first = ", ".join(str(c)[:19] for c in conflicts[:3])
+        raise ValidationError("duplicate_timestamps",
+                              f"{len(conflicts)} candle keys carry different candles in one response (first: {first}); "
+                              "looks like a time-base problem, so nothing was stored")
+    out = pd.DataFrame(notes, columns=["candle_key", "kind", "detail"])
+    return (df[keep].reset_index(drop=True), ist[keep].reset_index(drop=True), key[keep].reset_index(drop=True), out)
 
 
 def _find_anomalies(tf: Timeframe, df: pd.DataFrame, ist: pd.Series, key: pd.Series) -> pd.DataFrame:

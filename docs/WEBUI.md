@@ -129,6 +129,14 @@ worker. A program outside this application holding a database file is reported a
 * **Server does not stop** — `stop_stockdata.bat --force --yes` ends the unresponsive server process only; downloads are left alone unless you add `--kill-workers` (recovery only: the window in flight is requested again, completed windows are kept).
 * **Token expired during a long run** — the job stops with *Failed — the access token was rejected or has expired*. Settings →
   replace the token → **Resume** (one request was spent on the rejection; completed windows are kept).
+* **`DH-906: Invalid Token` (or "authentication rejected")** — Dhan's data endpoints answer a rejected access token as HTTP 400 `DH-906`
+  "Invalid Token". The run stops at once (one request spent, nothing recorded as failed). Generate a new token in the Dhan console,
+  paste it on **Providers** (or Settings → General) together with the client id of the *same* account, press *Test connection*, then
+  **Resume**. A token that has not expired can still be invalid if a newer one was generated, or if the client id belongs to another account.
+* **Saving credentials fails with "The credentials file ... could not be replaced or written"** (Windows) — another program has `.env`
+  open (an editor, antivirus, OneDrive/backup sync) or the file is read-only. The application retries, clears a read-only flag, repairs
+  its own permissions and finally overwrites in place; if the message still appears, close the program holding the file or run
+  `attrib -R <path>\.env`, then save again. Stray `.env.tmp*` files left by earlier failures are safe to delete.
 * **Worker "possibly stalled"** — the process is alive but silent for 2+ minutes. Look at the log; **Force stop** then **Resume** if it is hung.
 * **Power loss / forced kill** — DuckDB recovers from its write-ahead log; the job shows *Interrupted*; **Resume**.
 * **"database is locked"** — another program (or a second downloader started by hand) holds the file. Close it, then **Resume**.

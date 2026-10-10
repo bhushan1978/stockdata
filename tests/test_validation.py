@@ -144,11 +144,43 @@ def test_timezone_shift_detected_as_systematic():
     assert e.value.code == "systematic_anomalies"
 
 
-def test_duplicate_timestamps_rejected():
+def test_identical_duplicate_candles_are_collapsed_to_one_and_flagged():
     b = body(bars())
     b["timestamp"][1] = b["timestamp"][0]
+    b["volume"][1] = b["volume"][0]                                   # the same candle twice, byte for byte
+    v = validate_response(INTRADAY_15, b, WIN_I)
+    assert v.n == 4 and list(v.candles["candle_timestamp"].dt.strftime("%H:%M")) == ["09:15", "09:45", "10:00", "10:15"]
+    note = v.anomalies[v.anomalies["kind"] == "duplicate_dropped"]
+    assert len(note) == 1 and "identical copies" in note["detail"].iloc[0]
+
+
+def test_different_candles_for_one_key_are_not_stored_nothing_is_merged_and_the_rest_of_the_response_is():
+    """Seen live (WELSPUNLIV daily, 1990 to today): one repeated date must not discard 36 years of candles."""
+    rows = [(datetime(2024, 5, d), 100 + d, 110 + d, 90 + d, 105 + d, 1000 + d) for d in (6, 7, 8, 9, 10)]
+    b = body(rows)
+    for k, val in zip(("open", "high", "low", "close", "volume", "timestamp"), (500, 510, 490, 505, 7, epoch(datetime(2024, 5, 7, 18, 15)))):
+        b[k].append(val)                                              # a second, different 7 May candle (evening timestamp)
+    v = validate_response(DAILY, b, WIN_D)
+    assert [d.date() for d in v.candles["candle_date"]] == [date(2024, 5, 6), date(2024, 5, 8), date(2024, 5, 9), date(2024, 5, 10)]
+    conflict = v.anomalies[v.anomalies["kind"] == "duplicate_conflict"]
+    assert len(conflict) == 1 and conflict["candle_key"].iloc[0] == datetime(2024, 5, 7)
+    detail = conflict["detail"].iloc[0]
+    assert "none stored" in detail and "o=107" in detail and "o=500" in detail and "v=1007" in detail and "v=7" in detail   # both raw rows kept for review
+    assert not (v.candles["open"] == 500).any() and not (v.candles["open"] == 107).any()        # neither was picked or blended
+
+
+def test_many_conflicting_keys_still_reject_the_whole_response_as_a_time_base_problem():
+    rows = [(datetime(2024, 5, d), 100 + d, 110 + d, 90 + d, 105 + d, 1000 + d) for d in range(1, 15)]
+    b = body(rows + [(datetime(2024, 5, d, 18, 15), 1, 2, 1, 2, 9) for d in range(1, 8)])   # 7 days with a second, different candle
     with pytest.raises(ValidationError) as e:
-        validate_response(INTRADAY_15, b, WIN_I)
+        validate_response(DAILY, b, WIN_D)
+    assert e.value.code == "duplicate_timestamps" and "nothing was stored" in e.value.message
+
+
+def test_a_response_that_is_only_a_conflicting_pair_is_rejected_not_emptied():
+    b = body([(datetime(2024, 5, 7), 1, 2, 1, 2, 5), (datetime(2024, 5, 7, 18, 15), 3, 4, 3, 4, 6)])
+    with pytest.raises(ValidationError) as e:
+        validate_response(DAILY, b, WIN_D)
     assert e.value.code == "duplicate_timestamps"
 
 
@@ -200,3 +232,22 @@ def test_a_time_base_shift_is_still_caught_even_though_1530_is_tolerated():
     with pytest.raises(ValidationError) as e:
         validate_response(INTRADAY_15, body(rows), WIN_I)
     assert e.value.code == "systematic_anomalies"
+
+
+def test_a_response_with_a_conflicting_duplicate_commits_cleanly_and_the_integrity_checks_still_pass(tmp_path):
+    from stockdata.db import CandleDB
+    from stockdata.instruments import Instrument
+    from stockdata.reports import integrity_checks
+    rows = [(datetime(2024, 5, d), 100 + d, 110 + d, 90 + d, 105 + d, 1000 + d) for d in (6, 7, 8, 9, 10)]
+    b = body(rows)
+    for k, val in zip(("open", "high", "low", "close", "volume", "timestamp"), (500, 510, 490, 505, 7, epoch(datetime(2024, 5, 7, 18, 15)))):
+        b[k].append(val)
+    inst = Instrument("NSE_EQ", 900001, "SIMALPHA", "EQUITY")
+    with CandleDB(DAILY, tmp_path / "d.duckdb") as db:
+        v = validate_response(DAILY, b, WIN_D)
+        db.commit_window(inst, WIN_D, candles=v.candles, anomalies=v.anomalies, zero_volume=v.zero_volume_rows, attempts=1, http_status=200)
+        assert db.con.execute("SELECT count(*) FROM candles_daily").fetchone()[0] == 4
+        kinds = dict(db.con.execute("SELECT kind, count(*) FROM data_anomalies GROUP BY 1").fetchall())
+        assert kinds == {"duplicate_conflict": 1}
+        assert db.con.execute("SELECT status FROM download_windows").fetchone()[0] == "complete"
+        assert all(c.ok for c in integrity_checks(db))

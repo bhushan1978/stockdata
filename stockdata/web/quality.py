@@ -22,6 +22,9 @@ ANOMALY_NOTES = {
     "post_close_bar": ("expected", "A bar starting at 15:30 (present in some periods). Real data, stored as received."),
     "off_grid": ("warning", "A bar that is not on the 15-minute grid. Stored as received; worth a look."),
     "negative_volume": ("warning", "A bar with negative volume as sent by Dhan. Stored as received, never corrected."),
+    "duplicate_dropped": ("warning", "Dhan sent the identical candle more than once in one response. One copy was stored; nothing was lost."),
+    "duplicate_conflict": ("warning", "Dhan sent two or more DIFFERENT candles for one date or time. None was stored (a visible gap) and nothing was "
+                                      "merged or guessed; the raw values of each are in the flag detail so you can decide."),
 }
 FNO_NOTE = ("From 3 August 2026 the last 15-minute bar of a session starts at 15:00 for F&O stocks. That is expected and is not "
             "reported as a Dhan data defect.")

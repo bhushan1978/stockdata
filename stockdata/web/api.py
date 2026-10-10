@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from stockdata.timeframes import TIMEFRAMES
 from stockdata.web import jobs as J
-from stockdata.web.credentials import CredentialStore
+from stockdata.web.credentials import CredentialFileError, CredentialStore
 from stockdata.web.data import DataAccess, DatabaseBusy, DatabaseMissing, DbGate
 from stockdata.web.maintenance import Maintenance
 from stockdata.providers import PROVIDER_NAMES, get_provider
@@ -292,6 +292,11 @@ def create_app(settings: WebSettings, *, start_scheduler: bool = True) -> FastAP
     @app.exception_handler(ValueError)
     async def _value(_, exc: ValueError):
         return JSONResponse({"error": redact(str(exc))}, status_code=400)
+
+    @app.exception_handler(CredentialFileError)
+    async def _cred_file(_, exc: CredentialFileError):
+        log.warning("credentials file not writable: %s", exc)
+        return JSONResponse({"error": redact(str(exc))}, status_code=409)
 
     @app.exception_handler(Exception)
     async def _any(_, exc: Exception):
