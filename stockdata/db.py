@@ -186,6 +186,15 @@ class CandleDB:
             raise DatabaseMismatchError(
                 f"{self.path} is a {row[0] if row else '?'!r} database; refusing to open it as {self.tf.name!r}")
 
+    def next_id(self, table: str, column: str) -> int:
+        """Next integer id: ``max(existing) + 1``.
+
+        Not ``nextval()``: after a hard kill (SIGKILL, TerminateProcess, power loss) DuckDB replays the committed rows
+        from its write-ahead log but NOT the sequence advances, so ``nextval()`` hands out ids that already exist and
+        every later run fails on the primary key (found by killing a real worker mid-run). One process owns the file
+        at a time, so max + 1 cannot race. ``table``/``column`` are fixed literals from this module."""
+        return self.con.execute(f"SELECT coalesce(max({column}), 0) + 1 FROM {table}").fetchone()[0]
+
     # -- metadata ------------------------------------------------------------
     def set_meta(self, key: str, value: str, *, only_if_missing: bool = False) -> None:
         clause = "DO NOTHING" if only_if_missing else \
@@ -224,11 +233,12 @@ class CandleDB:
                   OR h.name IS DISTINCT FROM i.name OR h.isin IS DISTINCT FROM i.isin
                   OR h.series IS DISTINCT FROM i.series)""", [today])
             con.execute("""INSERT INTO instrument_history
-                SELECT nextval('history_id_seq'), i.exchange_segment, i.security_id, i.symbol, i.name,
+                SELECT ? + row_number() OVER (ORDER BY i.security_id), i.exchange_segment, i.security_id, i.symbol, i.name,
                        i.isin, i.series, ?, NULL
                 FROM incoming i WHERE NOT EXISTS (
                   SELECT 1 FROM instrument_history h WHERE h.exchange_segment = i.exchange_segment
-                  AND h.security_id = i.security_id AND h.valid_to IS NULL)""", [today])
+                  AND h.security_id = i.security_id AND h.valid_to IS NULL)""",
+                        [self.next_id("instrument_history", "history_id") - 1, today])
             con.execute("""INSERT INTO instruments
                 SELECT exchange_segment, security_id, symbol, name, isin, series, instrument,
                        instrument_type, exchange_id, segment_code, lot_size, tick_size,
@@ -246,8 +256,9 @@ class CandleDB:
             con.execute("""UPDATE instruments SET is_active = false WHERE is_active AND NOT EXISTS (
                 SELECT 1 FROM incoming i WHERE i.exchange_segment = instruments.exchange_segment
                 AND i.security_id = instruments.security_id)""")
-            con.execute("INSERT INTO instrument_master_loads VALUES (nextval('run_id_seq'), ?, ?, ?, ?, ?, ?)",
-                        [utcnow(), source, sha256, rows_total, len(incoming), universe_desc])
+            con.execute("INSERT INTO instrument_master_loads VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        [self.next_id("instrument_master_loads", "load_id"), utcnow(), source, sha256, rows_total,
+                         len(incoming), universe_desc])
             con.unregister("incoming")
             con.commit()
         except Exception:
@@ -305,7 +316,7 @@ class CandleDB:
             """SELECT window_id FROM download_windows WHERE exchange_segment = ? AND security_id = ?
                AND window_from = ? AND window_to = ?""",
             [inst.exchange_segment, inst.security_id, w.start, w.end]).fetchone()
-        return row[0] if row else self.con.execute("SELECT nextval('window_id_seq')").fetchone()[0]
+        return row[0] if row else self.next_id("download_windows", "window_id")
 
     def _upsert_window(self, wid, inst, w, *, status, attempts, received, inserted, flagged, revised,
                        zero_volume, http_status, error_code, error_message, now) -> None:
@@ -407,7 +418,7 @@ class CandleDB:
 
     # -- runs ------------------------------------------------------------------
     def start_run(self, command: str) -> int:
-        rid = self.con.execute("SELECT nextval('run_id_seq')").fetchone()[0]
+        rid = self.next_id("download_runs", "run_id")
         self.con.execute("INSERT INTO download_runs (run_id, started_at_utc, status, command) "
                          "VALUES (?, ?, 'running', ?)", [rid, utcnow(), command])
         return rid

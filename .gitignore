@@ -36,3 +36,11 @@ venv/
 build/
 dist/
 .DS_Store
+
+# --- Web interface (docs/WEBUI.md) ---
+node_modules/
+*.tsbuildinfo
+# the prebuilt interface is kept so Windows users do not need Node.js; rebuild with build_frontend.bat
+!webui/dist/
+# data-directory choice saved by the Settings page (machine specific)
+stockdata_web.json

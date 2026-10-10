@@ -12,6 +12,7 @@ import json
 import random
 import socket
 import threading
+import time as _time
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -93,6 +94,7 @@ class FakeDhan:
     empty_error_code: str | None = None  # serve this error instead of empty arrays
     max_intraday_days: int = 90
     ms_epoch: bool = False
+    delay: float = 0.0               # seconds each request takes (lets tests stop/kill a run mid-flight)
     rules: list[dict] = field(default_factory=list)
     log: list[dict] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
@@ -141,6 +143,8 @@ class FakeDhan:
 
     def _handle(self, h, payload: dict) -> None:
         path = h.path
+        if self.delay:
+            _time.sleep(self.delay)
         with self._lock:
             self.log.append({"path": path, "payload": payload, "token_ok": h.headers.get("access-token") == self.token})
             rule = next((r for r in self.rules if r["times"] > 0 and r["match"](payload)), None)

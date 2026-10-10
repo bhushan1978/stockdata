@@ -10,19 +10,19 @@ from pathlib import Path
 
 import requests
 
-from stockdata import config
+from stockdata import config, jobcontrol
 from stockdata.budget import COUNTER_CAVEAT, RequestBudget, UsageLedger, read_usage, validate_limits
 from stockdata.config import Settings
 from stockdata.db import CandleDB
 from stockdata.dhan import DhanClient, RateLimiter
-from stockdata.downloader import Downloader, RunOptions, resolve_history_start, select_instruments
+from stockdata.downloader import Downloader, select_instruments
+from stockdata.plan import PlanError, build_download_plan
 from stockdata.instruments import (UniverseSpec, normalize_master, read_master, select_universe,
                                    sha256_of, summarize)
 from stockdata.refresh import RefreshOptions, Refresher
 from stockdata.reports import format_report, status_text
 from stockdata.timeframes import TIMEFRAMES, Timeframe, get_timeframe
 from stockdata.timeutil import cutoff_exclusive, ist_now, to_midnight
-from stockdata.windows import plan_windows
 
 log = logging.getLogger("stockdata")
 
@@ -31,7 +31,8 @@ def db_path(settings: Settings, tf: Timeframe) -> Path:
     return settings.daily_db_path if tf.name == "daily" else settings.intraday_db_path
 
 
-EXIT_CODES = {"completed": 0, "completed_with_errors": 2, "completed_with_issues": 2, "stopped_request_limit": 4}
+EXIT_CODES = {"completed": 0, "completed_with_errors": 2, "completed_with_issues": 2, "stopped_request_limit": 4,
+              "stopped_by_user": 5}   # 5: a supervisor (the web application) asked for a stop; resume = same command
 
 
 def apply_limit_args(settings: Settings, args) -> Settings:
@@ -165,38 +166,30 @@ def cmd_download(args, settings: Settings) -> int:
         raise SystemExit("--all downloads the entire configured universe. Re-run with "
                          "--confirm-full-download once the small tests have been reviewed.")
     with CandleDB(tf, path, read_only=args.dry_run) as db:
-        insts = select_instruments(db, symbols=csv_list(args.symbols),
-                                   security_ids=[int(x) for x in csv_list(args.security_ids) or []] or None,
-                                   select_all=args.all, limit=args.limit)
-        cutoff = cutoff_exclusive(ist_now(), config.FINALIZE_AFTER_HOUR_IST)
-        if args.end_date:
-            end = to_midnight(args.end_date)
-            if end > cutoff:
-                raise SystemExit(f"--end-date {args.end_date} is later than the last final day boundary "
-                                 f"{cutoff:%Y-%m-%d} (exclusive); today's candles are not final yet")
-            cutoff = end
-        history_start = resolve_history_start(tf, db, args.start_date, cutoff, persist=not args.dry_run)
-        window_days = args.window_days or tf.default_window_days
-        if tf.max_window_days and window_days > tf.max_window_days:
-            raise SystemExit(f"--window-days {window_days} exceeds the {tf.max_window_days}-day cap")
-        opts = RunOptions(
-            history_start=history_start, cutoff=cutoff, window_days=window_days,
-            overlap_days=args.overlap_days, refetch=args.refetch, retry_failed=args.retry_failed,
-            empty_error_codes=frozenset(csv_list(args.empty_error_codes) or []),
-            intraday_date_format=settings.intraday_date_format, client_id=settings.client_id)
-        print(f"{tf.name}: {len(insts)} instrument(s), range [{history_start:%Y-%m-%d}, {cutoff:%Y-%m-%d}) "
-              f"exclusive end, windows of <= {window_days} days, {settings.rps:g} req/s")
+        control = jobcontrol.JobControl.from_env()      # None unless a supervisor (the web application) set it
+        try:
+            plan = build_download_plan(
+                db, settings=settings, symbols=csv_list(args.symbols),
+                security_ids=[int(x) for x in csv_list(args.security_ids) or []] or None,
+                select_all=args.all, limit=args.limit, start_date=args.start_date, end_date=args.end_date,
+                window_days=args.window_days, overlap_days=args.overlap_days, refetch=args.refetch,
+                retry_failed=args.retry_failed, empty_error_codes=frozenset(csv_list(args.empty_error_codes) or []),
+                persist_history_start=not args.dry_run, with_windows=args.dry_run or control is not None)
+        except PlanError as exc:
+            raise SystemExit(str(exc))
+        opts, insts = plan.opts, plan.instruments
+        print(f"{tf.name}: {len(insts)} instrument(s), range [{opts.history_start:%Y-%m-%d}, {opts.cutoff:%Y-%m-%d}) "
+              f"exclusive end, windows of <= {opts.window_days} days, {settings.rps:g} req/s")
         if args.dry_run:
-            total = 0
-            for inst in insts:
-                cov = [] if opts.refetch else db.covered_intervals(inst)
-                total += len(plan_windows(cov, history_start, cutoff, window_days, opts.overlap_days))
+            total = plan.requests
             eta = timedelta(seconds=total / settings.rps)
             print(f"dry run: {total:,} request(s) would be made (~{eta} at the configured rate, before any retries); nothing sent.")
             print(usage_line(settings, planned=total))
             return 0
+        if control is not None:
+            control.report("plan", instruments=len(insts), windows=plan.requests)
         client = make_client(settings, tf.name, max_attempts=args.max_attempts)
-        stats = Downloader(db, client).run(insts, opts, command=f"download {tf.name}")
+        stats = Downloader(db, client, control=control).run(insts, opts, command=f"download {tf.name}")
         done = {k: v for k, v in stats.items() if k not in ("results", "instruments", "note")}
         print(f"\nrun {stats['status']}: {done}")
         if stats["note"]:

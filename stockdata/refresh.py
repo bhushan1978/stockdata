@@ -124,7 +124,7 @@ class Refresher:
             return job_id, True
         con.begin()
         try:
-            job_id = con.execute("SELECT nextval('refresh_job_seq')").fetchone()[0]
+            job_id = self.db.next_id("refresh_jobs", "job_id")
             con.execute("INSERT INTO refresh_jobs VALUES (?, ?, ?, ?, ?, ?, 'open', ?, NULL, ?, NULL)",
                         [job_id, inst.exchange_segment, inst.security_id, opts.start, opts.end, opts.prune_missing,
                          utcnow(), command or f"refresh {self.tf.name}"])

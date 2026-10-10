@@ -18,6 +18,11 @@ Scope is equity history only (no options, expiries or Greeks).
 > 429/5xx behaviour, and any full-universe download. See [Status of API assumptions](#status-of-api-assumptions),
 > [docs/DATA_QUALITY.md](docs/DATA_QUALITY.md) and [docs/CORPORATE_ACTIONS.md](docs/CORPORATE_ACTIONS.md).
 
+## Web interface (Windows-friendly)
+
+A local web application (`start_stockdata.bat`) manages the queue, pause/resume, live progress, charts and data quality on top of this
+downloader without changing it. See [docs/WEBUI.md](docs/WEBUI.md).
+
 ## Setup
 
 ```bash
@@ -78,7 +83,7 @@ python -m stockdata status daily           # counts and recent runs
 python -m stockdata report 15min --csv     # per-instrument coverage + integrity checks (+ CSV in data/reports/)
 ```
 
-Exit codes: `0` completed, `2` completed with failed/retriable windows (refresh: or held/absent candles to review), `3` aborted, `4` stopped at a request limit.
+Exit codes: `0` completed, `2` completed with failed/retriable windows (refresh: or held/absent candles to review), `3` aborted, `4` stopped at a request limit, `5` stopped on request (only when a supervisor such as the web interface asks; resume = the same command), `130` interrupted.
 DuckDB allows one writer per file, so `report`/`status` cannot open a file while a download on it is running.
 
 ### Refreshing history (explicit, audited)
@@ -213,7 +218,8 @@ application cannot see other applications' usage.
 pip install -r requirements-dev.txt && pytest -q
 ```
 
-245 tests run against `tests/fake_dhan.py`, a *synthetic* local server (instruments are `SIM*`). They demonstrate the
+326 tests run against `tests/fake_dhan.py`, a *synthetic* local server (instruments are `SIM*`); the web-interface tests also start real
+worker processes and a real server process. They demonstrate the
 mechanics (boundaries, timestamps, idempotency, retry, resume, atomic commit, isolation, corporate-action methodology on
 constructed series). They are not evidence about real Dhan or NSE data.
 

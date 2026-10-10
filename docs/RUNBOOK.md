@@ -1,5 +1,7 @@
 # Run book: first controlled full download
 
+> The same steps can be driven from the web interface (queue, pause/resume, live progress): see [WEBUI.md](WEBUI.md). This page uses the command line.
+
 Every command below is the project's actual CLI (`python -m stockdata ...`, run from the repository root).
 Each step says what it changes. Nothing here modifies corporate-action data or applies any price/volume adjustment.
 
@@ -77,6 +79,7 @@ python -m stockdata download 15min --all --confirm-full-download      # the SAME
 | 2 | completed with failed/retriable windows | `report <timeframe>`; rerun the same command for retriable ones |
 | 3 | aborted (bad/expired token, API down) | refresh the token or wait, rerun the same command |
 | 4 | stopped at a request limit | rerun later (the day count resets at IST midnight) or raise the limit deliberately |
+| 5 | stopped on request by the web interface (pause/stop) | rerun the same command, or press Resume in the interface |
 | 130 | interrupted by you | rerun the same command |
 
 ## 6. Daily `DH-907` ("incorrect parameters or no data present"): the exact procedure

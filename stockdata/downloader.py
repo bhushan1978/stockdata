@@ -34,6 +34,8 @@ class RunAborted(RuntimeError):
         self.status = status
 
 
+STOP_MESSAGE = ("stop requested; the in-flight window was committed and nothing is half-written; "
+                "rerun the same command to resume")
 LIMIT_ADVICE = ("checkpoints are preserved and nothing was recorded for the in-flight window; rerun the same command "
                 "to resume (the per-day count resets at IST midnight, or raise the limit deliberately)")
 
@@ -113,9 +115,31 @@ def select_instruments(db: CandleDB, *, symbols: list[str] | None, security_ids:
     return found[:limit] if limit else found
 
 
+def plan_instrument_windows(db: CandleDB, inst: Instrument, opts: RunOptions) -> list[Window]:
+    """The windows the downloader will walk for one instrument, newest first (the single source of truth for
+    both the real run and every preview/dry-run)."""
+    covered = [] if opts.refetch else db.covered_intervals(inst)
+    windows = plan_windows(covered, opts.history_start, opts.cutoff, opts.window_days, 0)
+    # The overlap only belongs on a *fresh* forward gap. If one of the plain windows already
+    # has a failed/retriable record, keep its exact key so the checkpoint is retried, not orphaned.
+    if opts.overlap_days and not opts.refetch and not any(db.window_status(inst, w) for w in windows):
+        windows = plan_windows(covered, opts.history_start, opts.cutoff, opts.window_days, opts.overlap_days)
+    return windows
+
+
 class Downloader:
-    def __init__(self, db: CandleDB, client: DhanClient):
+    def __init__(self, db: CandleDB, client: DhanClient, control=None):
         self.db, self.client, self.tf = db, client, db.tf
+        self.control = control      # optional stockdata.jobcontrol.JobControl (stop requests + progress); None = off
+        self._last_failure: str | None = None
+        self._last_attempts = 1
+
+    def _stop_requested(self) -> bool:
+        return self.control is not None and self.control.should_stop()
+
+    def _report(self, event: str, **fields) -> None:
+        if self.control is not None:
+            self.control.report(event, requests=self.client.requests_sent, **fields)
 
     def run(self, instruments: list[Instrument], opts: RunOptions, *, command: str = "") -> dict:
         if self.tf.max_window_days and opts.window_days > self.tf.max_window_days:
@@ -126,14 +150,21 @@ class Downloader:
         status, note = "failed", ""
         self._consecutive_retriable = 0
         sent_before = self.client.requests_sent
+        self._report("phase", phase="running")
         try:
             for n, inst in enumerate(instruments, 1):
+                if self._stop_requested():
+                    raise RunAborted(STOP_MESSAGE, status="stopped_by_user")
                 res = self._download_instrument(n, len(instruments), inst, opts, stats)
                 results.append(res)
             status = "completed_with_errors" if stats["failed"] or stats["retriable"] else "completed"
         except RunAborted as exc:
             status, note = exc.status, str(exc)
-            log.error("run %s: %s", "stopped at a request limit" if exc.status == "stopped_request_limit" else "aborted", exc)
+            if exc.status == "stopped_by_user":
+                log.warning("run stopped on request after the in-flight window was committed; "
+                            "rerun the same command to resume")
+            else:
+                log.error("run %s: %s", "stopped at a request limit" if exc.status == "stopped_request_limit" else "aborted", exc)
         except KeyboardInterrupt:
             status, note = "aborted", "interrupted by user"
             log.warning("interrupted; progress is checkpointed, rerun the same command to resume")
@@ -141,6 +172,7 @@ class Downloader:
         finally:
             stats["requests_made"] = self.client.requests_sent - sent_before   # every attempt, retries included
             self.db.finish_run(run_id, status, stats, note)
+            self._report("phase", phase="finished")
         stats["status"] = status
         stats["note"] = note
         stats["results"] = results
@@ -151,25 +183,27 @@ class Downloader:
                              stats: Counter) -> InstrumentResult:
         t0 = time.monotonic()
         res = InstrumentResult(inst.symbol, inst.security_id)
-        covered = [] if opts.refetch else self.db.covered_intervals(inst)
-        windows = plan_windows(covered, opts.history_start, opts.cutoff, opts.window_days, 0)
-        # The overlap only belongs on a *fresh* forward gap. If one of the plain windows already
-        # has a failed/retriable record, keep its exact key so the checkpoint is retried, not orphaned.
-        if opts.overlap_days and not opts.refetch and \
-                not any(self.db.window_status(inst, w) for w in windows):
-            windows = plan_windows(covered, opts.history_start, opts.cutoff, opts.window_days,
-                                   opts.overlap_days)
+        windows = plan_instrument_windows(self.db, inst, opts)
+        self._report("instrument_start", index=n, total=total, symbol=inst.symbol, security_id=inst.security_id)
         for w in windows:
             if self.db.window_status(inst, w) == "failed" and not opts.retry_failed:
                 res.windows["skipped_failed"] += 1
                 continue
+            if self._stop_requested():      # checked between windows only: the previous window is fully committed
+                self._report("instrument_done", skipped_failed=res.windows["skipped_failed"])
+                raise RunAborted(STOP_MESSAGE, status="stopped_by_user")
+            self._report("window_start", start=f"{w.start:%Y-%m-%d %H:%M}", end=f"{w.end:%Y-%m-%d %H:%M}")
+            rows_before, rev_before = res.rows_inserted, res.rows_revised
             outcome = self._download_window(inst, w, opts, stats, res)
             res.windows[outcome] += 1
             stats["attempted"] += 1
             stats[outcome] += 1
+            self._report("window_done", outcome=outcome, rows_inserted=res.rows_inserted - rows_before,
+                         rows_revised=res.rows_revised - rev_before, message=self._last_failure, attempts=self._last_attempts)
             if outcome == "retriable":
                 break  # API trouble: leave the rest of this instrument for the next run
         res.seconds = time.monotonic() - t0
+        self._report("instrument_done", skipped_failed=res.windows["skipped_failed"])
         log.info("[%d/%d] %s (%s): %d window(s) planned %s; +%s rows%s in %.1fs", n, total, inst.symbol,
                  inst.security_id, len(windows), dict(res.windows) or "{}", f"{res.rows_inserted:,}",
                  f", {res.rows_revised} REVISED" if res.rows_revised else "", res.seconds)
@@ -179,14 +213,17 @@ class Downloader:
                          res: InstrumentResult) -> str:
         payload = self.tf.payload(inst, w.start, w.end, intraday_date_format=opts.intraday_date_format,
                                   client_id=opts.client_id)
+        self._last_attempts = 1
         try:
             resp = self.client.post(self.tf.endpoint, payload)
+            self._last_attempts = resp.attempts
         except RequestLimitReached as exc:
             raise limit_abort(exc) from exc
         except DhanAuthError as exc:
             raise RunAborted(f"authentication rejected ({exc.message}); refresh the access token "
                              "and rerun the same command to resume") from exc
         except DhanPermanentError as exc:
+            self._last_attempts = exc.attempts
             self._consecutive_retriable = 0
             if exc.error_code and exc.error_code in opts.empty_error_codes:
                 empty = empty_result(self.tf)
@@ -198,13 +235,16 @@ class Downloader:
                                    http_status=exc.http_status, error_code=exc.error_code,
                                    error_message=exc.message)
             log.error("%s %s [%s, %s): FAILED %s", inst.symbol, self.tf.name, w.start, w.end, exc.message)
+            self._last_failure = f"{inst.symbol}: {exc.error_code or exc.http_status}: {exc.message}"
             return "failed"
         except DhanTransientError as exc:
+            self._last_attempts = exc.attempts
             self.db.record_failure(inst, w, status="retriable", attempts=exc.attempts,
                                    http_status=exc.http_status, error_code=exc.error_code,
                                    error_message=exc.message)
             log.error("%s %s [%s, %s): RETRIABLE after %d attempts: %s", inst.symbol, self.tf.name,
                       w.start, w.end, exc.attempts, exc.message)
+            self._last_failure = f"{inst.symbol}: {exc.message}"
             self._consecutive_retriable += 1
             if self._consecutive_retriable >= opts.breaker:
                 raise RunAborted(f"{opts.breaker} consecutive windows failed with temporary errors "
@@ -218,6 +258,7 @@ class Downloader:
                                    http_status=resp.http_status, error_code=exc.code,
                                    error_message=exc.message)
             log.error("%s %s [%s, %s): FAILED validation %s", inst.symbol, self.tf.name, w.start, w.end, exc)
+            self._last_failure = f"{inst.symbol}: validation {exc.code}"
             return "failed"
         out = self.db.commit_window(inst, w, candles=v.candles, anomalies=v.anomalies,
                                     zero_volume=v.zero_volume_rows, attempts=resp.attempts,
