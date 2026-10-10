@@ -1,9 +1,11 @@
 # --- Secrets: never commit credentials ---
-# Any *.env file (".env", "prod.env", " - Copy.env" ...) is ignored. Put credentials in the cloud
-# environment's secrets or a local, untracked .env; never edit/upload them through the GitHub web UI.
+# Any env-style file is ignored: ".env", ".env.local", "prod.env", " - Copy.env", ".env - Copy", ".env (1)",
+# "Copy of .env", "x.env.bak" ... Put credentials in the cloud environment's secrets or a local, untracked
+# .env; never create or upload them through the GitHub web UI. Only the blank template is allowed.
 .env
-.env.*
+.env*
 *.env
+*.env.*
 !.env.example
 *.token
 *.pem
