@@ -462,7 +462,7 @@ class AutomationService:
                     # remember it so the saved settings and the installed task agree.
                     cfg = cfg.model_copy(update={"run_whether_logged_on": False})
                     save_config(self.store, cfg)
-                    notice = TS.LOGGED_OFF_REFUSED.replace("{detail}", str(exc))
+                    notice = TS.LOGGED_OFF_REFUSED.replace("{detail}", str(exc).rstrip(". "))
                     specs, installed, i = self.specs(cfg), [], 0
                     continue
                 raise JobError(TS.explain_register_failure(str(exc)), 400)

@@ -4,6 +4,7 @@
 //   node tools/dev/ui_smoke/smoke_features.cjs <scratch dir> <screenshot dir>
 // Needs Node.js, Playwright (PLAYWRIGHT_PATH may point at the package) and a Chromium. Not needed for normal use.
 const fs = require('fs')
+const { spawnSync } = require('child_process')
 const { chromium } = require(process.env.PLAYWRIGHT_PATH || 'playwright')
 
 const scratch = process.argv[2]
@@ -217,6 +218,38 @@ const goto = async (hash, ready) => { await page.goto(base + '/#' + hash); if (r
     await page.waitForSelector('.modal th:has-text("Provider")', { timeout: 15000 })
     check(/requests/i.test(await page.locator('.modal').innerText()), 'plan table')
     await cancelDialog()
+  })
+
+  await step('Automation: the signed-in-only fallback notice is shown (screen rendered against the backend\'s real response; the scheduler is simulated)', async () => {
+    const r = spawnSync(cfg.python, [cfg.repo + '/tools/dev/ui_smoke/recorded_install_notice.py'], { cwd: cfg.repo, encoding: 'utf8', timeout: 120000 })
+    check(r.status === 0, 'helper failed: ' + (r.stderr || '').slice(-300))
+    const recorded = JSON.parse(r.stdout.trim().split('\n').pop())
+    check(recorded.notice && recorded.notice.includes('SIGNED IN') && recorded.config.run_whether_logged_on === false, 'unexpected recorded response')
+    let installed = false
+    await page.route('**/api/automation', async (route) => {
+      if (route.request().method() !== 'GET') return route.continue()
+      if (installed) return route.fulfill({ json: recorded })
+      const body = await (await route.fetch()).json()                       // the real status, with the scheduler shown as available and the box ticked
+      body.scheduler = { backend: 'windows', available: true }
+      body.tasks = body.tasks.map((t) => ({ ...t, available: true, backend: 'windows', problem: null }))
+      body.config.run_whether_logged_on = true
+      return route.fulfill({ json: body })
+    })
+    await page.route('**/api/automation/task/install', (route) => { installed = true; return route.fulfill({ json: recorded }) })
+    try {
+      await goto('/queue', 'text=Active & queued'); await goto('/automation', 'text=Windows Task Scheduler')
+      await page.waitForFunction(() => document.querySelector('label:has(input[type=checkbox])') && [...document.querySelectorAll('label')].some((l) => l.textContent.includes('Run even when I am logged off') && l.querySelector('input').checked), null, { timeout: 15000 })
+      await page.click('button:has-text("Install / update tasks")')
+      await page.waitForSelector('.modal:has-text("Install the scheduled tasks")'); await confirm('Confirm')
+      await page.waitForSelector('.banner:has-text("The tasks were installed with a change")', { timeout: 15000 })
+      const banner = await page.innerText('.banner:has-text("The tasks were installed with a change")')
+      check(banner.includes('SIGNED IN') && banner.includes('Access is denied') && banner.includes('Run as administrator'), 'notice text: ' + banner)
+      await page.waitForFunction(() => [...document.querySelectorAll('label')].some((l) => l.textContent.includes('Run even when I am logged off') && l.querySelector('input') && !l.querySelector('input').checked), null, { timeout: 15000 })
+      check((await page.innerText('.panel:has-text("Windows Task Scheduler")')).includes('installed'), 'tasks not shown as installed')
+      await shot('automation-fallback-notice')
+    } finally {
+      await page.unroute('**/api/automation'); await page.unroute('**/api/automation/task/install')
+    }
   })
 
   // ------------------------------------------------------------------ corporate actions + adjusted view
