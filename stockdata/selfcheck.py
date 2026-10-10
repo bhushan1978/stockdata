@@ -16,7 +16,6 @@ from pathlib import Path
 from stockdata import config
 from stockdata.config import Settings
 from stockdata.db import CandleDB
-from stockdata.dhan import DhanClient, RateLimiter
 from stockdata.downloader import Downloader, RunOptions, select_instruments
 from stockdata.instruments import normalize_master, read_master, select_universe, sha256_of
 from stockdata.reports import coverage, integrity_checks
@@ -26,6 +25,15 @@ from stockdata.timeutil import cutoff_exclusive, ist_now
 
 def _sha(path: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
+
+
+class _LimitStop(Exception):
+    pass
+
+
+def _stop_if_limited(stats: dict, client) -> None:
+    if stats["status"] == "stopped_request_limit":
+        raise _LimitStop(f"{stats['note']}\n{client.budget.summary()}")
 
 
 class Recorder:
@@ -38,7 +46,15 @@ class Recorder:
 
 
 def run(args, settings: Settings) -> int:
-    from stockdata.cli import acquire_master, csv_list, universe_from_args
+    try:
+        return _run(args, settings)
+    except _LimitStop as stop:
+        print(f"\nSTOPPED at a request limit: {stop}")
+        return 4
+
+
+def _run(args, settings: Settings) -> int:
+    from stockdata.cli import acquire_master, csv_list, make_client, universe_from_args
     settings = dataclasses.replace(settings, data_dir=settings.data_dir / "selfcheck")
     token = settings.require_token()
     rec = Recorder()
@@ -52,12 +68,14 @@ def run(args, settings: Settings) -> int:
         with CandleDB(tf, paths[tf.name]) as db:
             db.load_instruments(universe, source=source, sha256=sha256_of(data), rows_total=len(raw), universe_desc="selfcheck")
     sent: list[dict] = []
+    clients: list = []
     for tf in (DAILY, INTRADAY_15):
         other = paths["15min" if tf.name == "daily" else "daily"]
         other_before = _sha(other)
         days = args.daily_days if tf is DAILY else args.intraday_days
         start = datetime.combine((cutoff - timedelta(days=days)).date(), datetime.min.time())
-        client = DhanClient(token, settings.base_url, client_id=settings.client_id, limiter=RateLimiter(settings.rps))
+        client = make_client(settings, tf.name)
+        clients.append(client)
         real_post = client.post
         client.post = lambda path, payload, _p=real_post: (sent.append({"tf": tf.name, **payload}), _p(path, payload))[1]
         opts = RunOptions(history_start=start, cutoff=cutoff, window_days=tf.default_window_days,
@@ -67,6 +85,7 @@ def run(args, settings: Settings) -> int:
             dl = Downloader(db, client)
             count = lambda: db.con.execute(f"SELECT count(*) FROM {tf.table}").fetchone()[0]
             s1 = dl.run(insts, opts, command="selfcheck run 1")
+            _stop_if_limited(s1, client)
             n1 = count()
             rec.add(f"{tf.name}: first run completed without failed/retriable windows",
                     s1["status"] == "completed", f"{s1['status']} {s1['note']}")
@@ -77,8 +96,10 @@ def run(args, settings: Settings) -> int:
                     f"{n1:,} rows; " + ", ".join(f"{r.symbol}={r.candles}" for r in per.itertuples()))
             before = db.con.execute(f"SELECT * FROM {tf.table} ORDER BY ALL").fetchall()
             s2 = dl.run(insts, opts, command="selfcheck run 2 (idempotency)")
+            _stop_if_limited(s2, client)
             rec.add(f"{tf.name}: second run requested nothing", s2["attempted"] == 0, f"{s2['attempted']} windows attempted")
             s3 = dl.run(insts, dataclasses.replace(opts, refetch=True), command="selfcheck run 3 (forced refetch)")
+            _stop_if_limited(s3, client)
             same = db.con.execute(f"SELECT * FROM {tf.table} ORDER BY ALL").fetchall() == before
             rec.add(f"{tf.name}: forced re-download adds no rows and no revisions",
                     same and s3["rows_inserted"] == 0 and s3["rows_revised"] == 0,
@@ -110,4 +131,6 @@ def run(args, settings: Settings) -> int:
                              "results": rec.results}, indent=2))
     failed = [r for r in rec.results if not r["ok"]]
     print(f"\n{len(rec.results) - len(failed)}/{len(rec.results)} checks passed; report {f}")
+    for client in clients:
+        print(client.budget.summary())
     return 1 if failed else 0

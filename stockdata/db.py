@@ -88,6 +88,30 @@ def _ddl(tf: Timeframe) -> list[str]:
             window_id BIGINT NOT NULL, detected_at_utc TIMESTAMP NOT NULL,
             PRIMARY KEY (exchange_segment, security_id, candle_key,
                          new_open, new_high, new_low, new_close, new_volume))""",
+        # --- explicit historical refresh (see stockdata/refresh.py): jobs, per-window progress, applied changes
+        "CREATE SEQUENCE IF NOT EXISTS refresh_job_seq START 1",
+        """CREATE TABLE IF NOT EXISTS refresh_jobs (
+            job_id BIGINT PRIMARY KEY, exchange_segment VARCHAR NOT NULL, security_id BIGINT NOT NULL,
+            range_from TIMESTAMP NOT NULL, range_to TIMESTAMP NOT NULL, prune_missing BOOLEAN NOT NULL,
+            status VARCHAR NOT NULL CHECK (status IN ('open', 'complete')),
+            created_at_utc TIMESTAMP NOT NULL, finished_at_utc TIMESTAMP, command VARCHAR, note VARCHAR)""",
+        """CREATE TABLE IF NOT EXISTS refresh_windows (
+            job_id BIGINT NOT NULL, window_from TIMESTAMP NOT NULL, window_to TIMESTAMP NOT NULL,
+            status VARCHAR NOT NULL CHECK (status IN
+                ('pending', 'unchanged', 'replaced', 'empty', 'held_empty', 'failed', 'retriable')),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            rows_old INTEGER, rows_new INTEGER, rows_changed INTEGER, rows_added INTEGER,
+            rows_missing INTEGER, rows_removed INTEGER,
+            http_status INTEGER, error_code VARCHAR, error_message VARCHAR,
+            first_attempt_at_utc TIMESTAMP, last_attempt_at_utc TIMESTAMP, applied_at_utc TIMESTAMP,
+            PRIMARY KEY (job_id, window_from, window_to))""",
+        """CREATE TABLE IF NOT EXISTS refresh_changes (
+            job_id BIGINT NOT NULL, exchange_segment VARCHAR NOT NULL, security_id BIGINT NOT NULL,
+            candle_key TIMESTAMP NOT NULL,
+            change_type VARCHAR NOT NULL CHECK (change_type IN ('revised', 'added', 'missing_kept', 'removed')),
+            old_open DOUBLE, old_high DOUBLE, old_low DOUBLE, old_close DOUBLE, old_volume BIGINT,
+            new_open DOUBLE, new_high DOUBLE, new_low DOUBLE, new_close DOUBLE, new_volume BIGINT,
+            applied_at_utc TIMESTAMP NOT NULL)""",
         *corp_actions.SCHEMA,
     ]
 

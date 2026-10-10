@@ -11,6 +11,8 @@ from datetime import date
 from pathlib import Path
 from urllib.parse import urlparse
 
+from stockdata.budget import DEFAULT_MAX_PER_DAY, DEFAULT_MAX_PER_RUN, validate_limits
+
 API_BASE_URL = "https://api.dhan.co/v2"
 MASTER_URLS = {
     "compact": "https://images.dhan.co/api-data/api-scrip-master.csv",
@@ -64,6 +66,13 @@ class Settings:
     data_dir: Path = Path("data")
     rps: float = DEFAULT_RPS
     intraday_date_format: str = "datetime"  # "datetime" | "date"
+    max_requests_per_run: int = DEFAULT_MAX_PER_RUN
+    max_requests_per_day: int = DEFAULT_MAX_PER_DAY   # IST calendar day, all downloaders of this application
+    ledger_path: Path | None = None                    # shared usage ledger; resolved once in from_env
+
+    @property
+    def request_ledger_path(self) -> Path:
+        return self.ledger_path or self.data_dir / "request_ledger.sqlite"
 
     @property
     def daily_db_path(self) -> Path:
@@ -84,13 +93,20 @@ class Settings:
         fmt = env("DHAN_INTRADAY_DATE_FORMAT", "datetime").lower()
         if fmt not in ("datetime", "date"):
             raise ValueError("DHAN_INTRADAY_DATE_FORMAT must be 'datetime' or 'date'")
+        per_run = int(env("STOCKDATA_MAX_REQUESTS_PER_RUN", DEFAULT_MAX_PER_RUN))
+        per_day = int(env("STOCKDATA_MAX_REQUESTS_PER_DAY", DEFAULT_MAX_PER_DAY))
+        validate_limits(per_run, per_day)
+        folder = Path(data_dir or env("STOCKDATA_DIR", "data"))
         return cls(
             access_token=env("DHAN_ACCESS_TOKEN") or None,
             client_id=env("DHAN_CLIENT_ID") or None,
             base_url=env("DHAN_BASE_URL", API_BASE_URL).rstrip("/"),
-            data_dir=Path(data_dir or env("STOCKDATA_DIR", "data")),
+            data_dir=folder,
             rps=float(env("STOCKDATA_RPS", DEFAULT_RPS)),
             intraday_date_format=fmt,
+            max_requests_per_run=per_run,
+            max_requests_per_day=per_day,
+            ledger_path=Path(env("STOCKDATA_LEDGER") or folder / "request_ledger.sqlite"),
         )
 
     def require_token(self) -> str:

@@ -25,9 +25,15 @@ Dhan volumes show no step at those dates either (consistent with adjusted volume
 They may be market moves, unadjusted older events, or restructurings (demerger/merger) that cannot be adjusted generically.
 Treat every period before 2010 as **not adjustment-validated**.
 
-**Operational consequence.** Because Dhan adjusts retroactively, every stored candle before a future split/bonus becomes stale on
-that date. The 7-day overlap on incremental runs logs the difference in `candle_revisions`, but `--refetch` keeps first-seen
-candles, so a replace/refresh mechanism is needed before a long-lived store can be trusted across corporate actions.
+**Operational consequence.** Because Dhan appears to adjust retroactively, every stored candle before a future split/bonus
+becomes stale on that date. The 7-day overlap on incremental runs (and `download --refetch`) *records* the difference in
+`candle_revisions` without overwriting anything. To bring stored history in line, use the explicit, audited
+`python -m stockdata refresh <daily|15min> --symbols ... --start-date ...` (see the README): it validates Dhan's current data
+first, replaces the range atomically, and records old versus new. **Refresh stores Dhan's data exactly as received; it never
+applies a corporate-action factor, never builds or reads `adjustment_segments`, and never marks an event verified.** A refresh
+of an instrument that has a verified, applied event leaves the raw table raw (the adjusted view still derives from raw x factor).
+Do not run `corp-actions apply` on Dhan data until the NSE comparison has shown the history is raw (it currently looks
+adjusted, so applying would adjust twice).
 
 ## Principles
 

@@ -15,7 +15,8 @@ import pandas as pd
 
 from stockdata import config
 from stockdata.config import Settings
-from stockdata.dhan import DhanClient, DhanError, RateLimiter
+from stockdata.budget import RequestLimitReached
+from stockdata.dhan import DhanClient, DhanError
 from stockdata.instruments import Instrument
 from stockdata.timeframes import DAILY, INTRADAY_15, Timeframe
 from stockdata.timeutil import IST, cutoff_exclusive, ist_now
@@ -156,10 +157,16 @@ def run(args, settings: Settings) -> int:
                 sec = found[0].security_id if found else None
     if sec is None:
         raise SystemExit("unknown security id: pass --security-id, or run `instruments load` so the symbol resolves")
-    client = DhanClient(token, settings.base_url, client_id=settings.client_id,
-                        limiter=RateLimiter(min(settings.rps, 2.0)), max_attempts=3)
+    import dataclasses
+    from stockdata.cli import make_client
+    client = make_client(dataclasses.replace(settings, rps=min(settings.rps, 2.0)), "verify-api", max_attempts=3)
     pr = Prober(client, Instrument("NSE_EQ", sec, args.symbol, "EQUITY"), settings)
-    pr.run_all()
+    try:
+        pr.run_all()
+    except RequestLimitReached as exc:
+        print("\n".join(pr.findings))
+        print(f"\nSTOPPED: {exc}. {client.budget.summary()}")
+        return 4
     out = settings.data_dir / "reports"
     out.mkdir(parents=True, exist_ok=True)
     f = out / f"verify_api_{datetime.now():%Y%m%d_%H%M%S}.json"
@@ -167,4 +174,5 @@ def run(args, settings: Settings) -> int:
                              "requests": pr.log}, indent=2, default=str))
     print("\n".join(pr.findings))
     print(f"\nraw request/response summary written to {f}")
+    print(client.budget.summary())
     return 0

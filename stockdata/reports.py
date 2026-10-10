@@ -140,7 +140,9 @@ def status_text(db: CandleDB) -> str:
            f"  instruments: {rows('SELECT count(*), count(*) FILTER (WHERE is_active) FROM instruments')[0]} (total, active)",
            f"  candles:     {rows(f'SELECT count(*) FROM {db.tf.table}')[0][0]:,}",
            f"  windows:     {dict(rows('SELECT status, count(*) FROM download_windows GROUP BY 1'))}",
-           f"  outstanding failed/retriable: {len(db.outstanding_failures())}"]
+           f"  outstanding failed/retriable: {len(db.outstanding_failures())}",
+           f"  refresh jobs: {dict(rows('SELECT status, count(*) FROM refresh_jobs GROUP BY 1')) or 'none'}"
+           f"; refresh changes applied: {dict(rows('SELECT change_type, count(*) FROM refresh_changes GROUP BY 1')) or 'none'}"]
     for r in rows("SELECT run_id, started_at_utc, status, windows_attempted, rows_inserted, note "
                   "FROM download_runs ORDER BY run_id DESC LIMIT 3"):
         out.append(f"  run {r[0]} {r[1]:%Y-%m-%d %H:%M}Z {r[2]} windows={r[3]} rows+={r[4]} {r[5] or ''}")

@@ -11,12 +11,14 @@ from pathlib import Path
 import requests
 
 from stockdata import config
+from stockdata.budget import COUNTER_CAVEAT, RequestBudget, UsageLedger, read_usage, validate_limits
 from stockdata.config import Settings
 from stockdata.db import CandleDB
 from stockdata.dhan import DhanClient, RateLimiter
 from stockdata.downloader import Downloader, RunOptions, resolve_history_start, select_instruments
 from stockdata.instruments import (UniverseSpec, normalize_master, read_master, select_universe,
                                    sha256_of, summarize)
+from stockdata.refresh import RefreshOptions, Refresher
 from stockdata.reports import format_report, status_text
 from stockdata.timeframes import TIMEFRAMES, Timeframe, get_timeframe
 from stockdata.timeutil import cutoff_exclusive, ist_now, to_midnight
@@ -27,6 +29,42 @@ log = logging.getLogger("stockdata")
 
 def db_path(settings: Settings, tf: Timeframe) -> Path:
     return settings.daily_db_path if tf.name == "daily" else settings.intraday_db_path
+
+
+EXIT_CODES = {"completed": 0, "completed_with_errors": 2, "completed_with_issues": 2, "stopped_request_limit": 4}
+
+
+def apply_limit_args(settings: Settings, args) -> Settings:
+    """Command-line request limits override the environment/defaults; invalid values stop the run early."""
+    per_run = getattr(args, "max_requests_per_run", None)
+    per_day = getattr(args, "max_requests_per_day", None)
+    per_run = settings.max_requests_per_run if per_run is None else per_run     # an explicit 0 must be rejected, not defaulted
+    per_day = settings.max_requests_per_day if per_day is None else per_day
+    try:
+        validate_limits(per_run, per_day)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+    return dataclasses.replace(settings, max_requests_per_run=per_run, max_requests_per_day=per_day)
+
+
+def make_client(settings: Settings, label: str, *, max_attempts: int = 5) -> DhanClient:
+    """Every API client of this application is created here, so every attempt is counted in the shared ledger."""
+    token = settings.require_token()
+    budget = RequestBudget(UsageLedger(settings.request_ledger_path), label,
+                           max_per_run=settings.max_requests_per_run, max_per_day=settings.max_requests_per_day)
+    return DhanClient(token, settings.base_url, client_id=settings.client_id, limiter=RateLimiter(settings.rps),
+                      max_attempts=max_attempts, budget=budget)
+
+
+def usage_line(settings: Settings, planned: int | None = None) -> str:
+    today = read_usage(settings.request_ledger_path)
+    used = sum(today.values())
+    text = (f"request limits: {settings.max_requests_per_run:,} per run, {settings.max_requests_per_day:,} per IST day; "
+            f"used today {used:,} ({', '.join(f'{k}={v:,}' for k, v in today.items()) or 'none'})")
+    if planned is not None:
+        room = min(settings.max_requests_per_run, settings.max_requests_per_day - used)
+        text += f"; this plan needs {planned:,}" + (" and FITS" if planned <= room else f" but only {max(room, 0):,} fit now: it will stop at the limit and resume later")
+    return text
 
 
 def setup_logging(settings: Settings, name: str, verbose: bool) -> None:
@@ -119,6 +157,7 @@ def cmd_download(args, settings: Settings) -> int:
     tf = get_timeframe(args.timeframe)
     if args.rps:
         settings = dataclasses.replace(settings, rps=args.rps)
+    settings = apply_limit_args(settings, args)
     path = db_path(settings, tf)
     if args.dry_run and not path.exists():
         raise SystemExit(f"{path} does not exist; run `instruments load` first")
@@ -153,21 +192,77 @@ def cmd_download(args, settings: Settings) -> int:
                 cov = [] if opts.refetch else db.covered_intervals(inst)
                 total += len(plan_windows(cov, history_start, cutoff, window_days, opts.overlap_days))
             eta = timedelta(seconds=total / settings.rps)
-            print(f"dry run: {total:,} request(s) would be made (~{eta} at the configured rate); nothing sent.")
+            print(f"dry run: {total:,} request(s) would be made (~{eta} at the configured rate, before any retries); nothing sent.")
+            print(usage_line(settings, planned=total))
             return 0
-        token = settings.require_token()
-        client = DhanClient(token, settings.base_url, client_id=settings.client_id,
-                            limiter=RateLimiter(settings.rps), max_attempts=args.max_attempts)
+        client = make_client(settings, tf.name, max_attempts=args.max_attempts)
         stats = Downloader(db, client).run(insts, opts, command=f"download {tf.name}")
         done = {k: v for k, v in stats.items() if k not in ("results", "instruments", "note")}
         print(f"\nrun {stats['status']}: {done}")
         if stats["note"]:
             print(f"note: {stats['note']}")
+        print(client.budget.summary())
         out = db.outstanding_failures()
         if out:
             print(f"{len(out)} failed/retriable window(s) outstanding; rerun the same command to retry the "
                   "retriable ones (add --retry-failed for permanent failures). See `report`.")
-        return {"completed": 0, "completed_with_errors": 2}.get(stats["status"], 3)
+        return EXIT_CODES.get(stats["status"], 3)
+
+
+# ------------------------------------------------------------------- refresh
+def cmd_refresh(args, settings: Settings) -> int:
+    tf = get_timeframe(args.timeframe)
+    if args.rps:
+        settings = dataclasses.replace(settings, rps=args.rps)
+    settings = apply_limit_args(settings, args)
+    path = db_path(settings, tf)
+    if not path.exists():
+        raise SystemExit(f"{path} does not exist; nothing to refresh")
+    if not (args.symbols or args.security_ids):
+        raise SystemExit("refresh needs an explicit --symbols or --security-ids (there is no --all for a refresh)")
+    with CandleDB(tf, path, read_only=args.dry_run) as db:
+        insts = select_instruments(db, symbols=csv_list(args.symbols),
+                                   security_ids=[int(x) for x in csv_list(args.security_ids) or []] or None, select_all=False)
+        cutoff = cutoff_exclusive(ist_now(), config.FINALIZE_AFTER_HOUR_IST)
+        start = to_midnight(args.start_date)
+        end = to_midnight(args.end_date) if args.end_date else cutoff
+        if end > cutoff:
+            raise SystemExit(f"--end-date {args.end_date} is later than the last final day boundary {cutoff:%Y-%m-%d} (exclusive)")
+        if start >= end:
+            raise SystemExit("--start-date must be before the (exclusive) end date")
+        window_days = args.window_days or tf.default_window_days
+        if tf.max_window_days and window_days > tf.max_window_days:
+            raise SystemExit(f"--window-days {window_days} exceeds the {tf.max_window_days}-day cap")
+        opts = RefreshOptions(start=start, end=end, window_days=window_days, prune_missing=args.prune_missing,
+                              retry_failed=args.retry_failed, intraday_date_format=settings.intraday_date_format,
+                              client_id=settings.client_id)
+        print(f"refresh {tf.name}: {', '.join(i.symbol for i in insts)}; range [{start:%Y-%m-%d}, {end:%Y-%m-%d}) exclusive end, "
+              f"windows of <= {window_days} days, {settings.rps:g} req/s; "
+              f"{'stored candles absent from Dhan will be ARCHIVED then DELETED (--prune-missing)' if args.prune_missing else 'stored candles absent from Dhan are kept'}")
+        print("data is stored exactly as received: no corporate-action factor is applied; independent split/bonus validation stays pending")
+        if args.dry_run:
+            total = 0
+            for inst in insts:
+                job, todo = Refresher(db, None).plan(inst, opts)
+                total += len(todo)
+                print(f"  {inst.symbol}: {'resume open job %d' % job if job else 'new job'}, {len(todo)} request(s)")
+            print(f"dry run: {total:,} request(s); nothing sent, nothing changed.")
+            print(usage_line(settings, planned=total))
+            return 0
+        client = make_client(settings, tf.name, max_attempts=args.max_attempts)
+        stats = Refresher(db, client).run(insts, opts, command=f"refresh {tf.name}")
+        for r in stats["results"]:
+            print(f"  {r.symbol}: job {r.job_id}{' (resumed)' if r.resumed else ''} windows {dict(r.windows)}; "
+                  f"changed {r.changed}, added {r.added}, absent-from-Dhan {r.missing}, removed {r.removed}")
+        print(f"\nrefresh {stats['status']}: requests made {stats['requests_made']}")
+        if stats["note"]:
+            print(f"note: {stats['note']}")
+        if stats["held_empty"]:
+            print(f"WARNING: {stats['held_empty']} window(s) got an empty response while candles are stored; nothing was deleted, review them.")
+        if any(r.missing and not opts.prune_missing for r in stats["results"]):
+            print("WARNING: some stored candles are absent from Dhan's current data and were kept (see refresh_changes, type missing_kept).")
+        print(client.budget.summary())
+        return EXIT_CODES.get(stats["status"], 3)
 
 
 # ------------------------------------------------------------- report / status
@@ -196,17 +291,30 @@ def cmd_report(args, settings: Settings) -> int:
 def cmd_status(args, settings: Settings) -> int:
     with _open_ro(args, settings) as db:
         print(status_text(db))
+    print(usage_line(settings))
+    return 0
+
+
+def cmd_usage(args, settings: Settings) -> int:
+    """Today's request usage and recent days from the shared ledger (this application only)."""
+    path = settings.request_ledger_path
+    today = read_usage(path)
+    print(f"ledger: {path}{'' if path.exists() else ' (not created yet)'}")
+    print(usage_line(settings))
+    for day, n in (read_usage(path, history=7) or []):
+        print(f"  {day}: {n:,}")
+    print(COUNTER_CAVEAT)
     return 0
 
 
 def cmd_verify_api(args, settings: Settings) -> int:
     from stockdata import verify_api
-    return verify_api.run(args, settings)
+    return verify_api.run(args, apply_limit_args(settings, args))
 
 
 def cmd_selfcheck(args, settings: Settings) -> int:
     from stockdata import selfcheck
-    return selfcheck.run(args, settings)
+    return selfcheck.run(args, apply_limit_args(settings, args))
 
 
 # --------------------------------------------------------------------- parser
@@ -214,6 +322,15 @@ def add_universe_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--universe-file", help="TOML universe filter (default config/universe.toml)")
     p.add_argument("--exchange"), p.add_argument("--segment"), p.add_argument("--instrument")
     p.add_argument("--series", help="comma list, e.g. EQ,BE ('' = any series)")
+
+
+def add_limit_args(p: argparse.ArgumentParser) -> None:
+    g = p.add_argument_group("request safety limits (every outbound attempt, retries included, is counted)")
+    g.add_argument("--max-requests-per-run", type=int,
+                   help="stop safely after this many attempts in this run (default STOCKDATA_MAX_REQUESTS_PER_RUN or 60,000)")
+    g.add_argument("--max-requests-per-day", type=int,
+                   help="stop safely at this many attempts per IST day across all runs/processes/timeframes "
+                        "(default STOCKDATA_MAX_REQUESTS_PER_DAY or 80,000; may not exceed Dhan's 100,000)")
 
 
 def add_master_args(p: argparse.ArgumentParser) -> None:
@@ -256,7 +373,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--retry-failed", action="store_true", help="also retry permanently failed windows")
     p.add_argument("--empty-error-codes", help="API error codes to record as 'empty' (only after verify-api)")
     p.add_argument("--dry-run", action="store_true", help="print the request plan; send nothing")
+    add_limit_args(p)
     p.set_defaults(func=cmd_download)
+
+    p = sub.add_parser("refresh", help="replace stored candles for chosen symbols and a date range with Dhan's current data "
+                                       "(validated first, atomic per window, audited, resumable)")
+    p.add_argument("timeframe", choices=list(TIMEFRAMES))
+    p.add_argument("--symbols", help="comma list, e.g. RELIANCE,TCS")
+    p.add_argument("--security-ids", help="comma list of Dhan security ids")
+    p.add_argument("--start-date", type=parse_date, required=True, help="first date to refresh (YYYY-MM-DD)")
+    p.add_argument("--end-date", type=parse_date, help="exclusive end date (default: last final day boundary)")
+    p.add_argument("--window-days", type=int, help="override the request window length")
+    p.add_argument("--prune-missing", action="store_true",
+                   help="also delete (after archiving to refresh_changes) stored candles absent from a validated, non-empty "
+                        "response; off by default")
+    p.add_argument("--retry-failed", action="store_true", help="also retry windows that failed permanently")
+    p.add_argument("--rps", type=float, help="requests per second (default STOCKDATA_RPS or 3)")
+    p.add_argument("--max-attempts", type=int, default=5)
+    p.add_argument("--dry-run", action="store_true", help="show the plan; send nothing, change nothing")
+    add_limit_args(p)
+    p.set_defaults(func=cmd_refresh)
+
+    p = sub.add_parser("usage", help="today's API request usage from the shared ledger and the configured limits")
+    p.set_defaults(func=cmd_usage)
 
     for name, fn, helptext in (("report", cmd_report, "coverage + integrity report"),
                                ("status", cmd_status, "counts and recent runs")):
@@ -269,6 +408,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("verify-api", help="LIVE probes of the unverified API assumptions (needs a token)")
     p.add_argument("--symbol", default="RELIANCE")
     p.add_argument("--security-id", type=int, help="skip the master lookup")
+    add_limit_args(p)
     p.set_defaults(func=cmd_verify_api)
 
     p = sub.add_parser("selfcheck", help="milestone check: small download x2 in both timeframes + integrity")
@@ -276,6 +416,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--symbols", required=True, help="three or so symbols, e.g. RELIANCE,TCS,INFY")
     p.add_argument("--daily-days", type=int, default=400)
     p.add_argument("--intraday-days", type=int, default=120)
+    add_limit_args(p)
     p.set_defaults(func=cmd_selfcheck)
 
     from stockdata import corp_cli

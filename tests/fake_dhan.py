@@ -156,6 +156,8 @@ class FakeDhan:
                 return
             if rule["status"] == "garbage":
                 return self._send(h, 200, None, raw=b'{"open": [1, 2')
+            if rule["status"] == "empty":      # a well-formed but empty answer (ambiguous: no data? outage?)
+                return self._send(h, 200, {k: [] for k in ("open", "high", "low", "close", "volume", "timestamp")})
             return self._send(h, rule["status"], rule["body"] or {"errorType": "Injected", "errorCode": "DH-908",
                                                                   "errorMessage": "injected failure"},
                               rule["headers"])

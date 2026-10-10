@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
 from stockdata import config
+from stockdata.budget import RequestLimitReached
 from stockdata.db import CandleDB
 from stockdata.dhan import (DhanAuthError, DhanClient, DhanPermanentError, DhanTransientError)
 from stockdata.instruments import Instrument
@@ -26,7 +27,19 @@ log = logging.getLogger("stockdata.download")
 
 
 class RunAborted(RuntimeError):
-    """The whole run must stop (bad token, API down); progress so far is kept."""
+    """The whole run must stop (bad token, API down, request cap); progress so far is kept."""
+
+    def __init__(self, message: str, status: str = "aborted"):
+        super().__init__(message)
+        self.status = status
+
+
+LIMIT_ADVICE = ("checkpoints are preserved and nothing was recorded for the in-flight window; rerun the same command "
+                "to resume (the per-day count resets at IST midnight, or raise the limit deliberately)")
+
+
+def limit_abort(exc: RequestLimitReached) -> RunAborted:
+    return RunAborted(f"{exc}; {LIMIT_ADVICE}", status="stopped_request_limit")
 
 
 @dataclass
@@ -112,19 +125,21 @@ class Downloader:
         run_id = self.db.start_run(command)
         status, note = "failed", ""
         self._consecutive_retriable = 0
+        sent_before = self.client.requests_sent
         try:
             for n, inst in enumerate(instruments, 1):
                 res = self._download_instrument(n, len(instruments), inst, opts, stats)
                 results.append(res)
             status = "completed_with_errors" if stats["failed"] or stats["retriable"] else "completed"
         except RunAborted as exc:
-            status, note = "aborted", str(exc)
-            log.error("run aborted: %s", exc)
+            status, note = exc.status, str(exc)
+            log.error("run %s: %s", "stopped at a request limit" if exc.status == "stopped_request_limit" else "aborted", exc)
         except KeyboardInterrupt:
             status, note = "aborted", "interrupted by user"
             log.warning("interrupted; progress is checkpointed, rerun the same command to resume")
             raise
         finally:
+            stats["requests_made"] = self.client.requests_sent - sent_before   # every attempt, retries included
             self.db.finish_run(run_id, status, stats, note)
         stats["status"] = status
         stats["note"] = note
@@ -166,6 +181,8 @@ class Downloader:
                                   client_id=opts.client_id)
         try:
             resp = self.client.post(self.tf.endpoint, payload)
+        except RequestLimitReached as exc:
+            raise limit_abort(exc) from exc
         except DhanAuthError as exc:
             raise RunAborted(f"authentication rejected ({exc.message}); refresh the access token "
                              "and rerun the same command to resume") from exc

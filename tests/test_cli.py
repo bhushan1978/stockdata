@@ -1,5 +1,7 @@
 """CLI wiring, selfcheck and verify-api, run against the synthetic local server."""
+import hashlib
 import json
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -148,3 +150,129 @@ def test_verify_api_reports_how_an_empty_window_is_signalled(cli, fake, capsys):
     fake.empty_error_code = "DH-907"
     out = _verify(cli, capsys)
     assert "a window with no data returns: ok=False" in out and "DH-907" in out
+
+
+# ------------------------------------------------------------ request limits through the CLI
+def test_download_stops_at_the_run_limit_with_exit_code_4_and_a_rerun_resumes(cli, fake, capsys):
+    cli("instruments", "load", "--file", MASTER)
+    args = ("download", "daily", "--symbols", "SIMALPHA,SIMBETA,SIMGAMMA", "--start-date", "2024-01-01")
+    code = cli(*args, "--max-requests-per-run", "2")
+    out = capsys.readouterr().out
+    assert code == 4 and len(fake.log) == 2
+    assert "per-run request limit reached" in out and "rerun the same command to resume" in out
+    assert "other applications using the same dhan account are not included" in out.lower()
+    assert cli(*args) == 0 and len(fake.log) == 3                       # only the one unfinished instrument is requested
+    capsys.readouterr()
+    assert cli("usage") == 0
+    usage = capsys.readouterr().out
+    assert "used today 3" in usage and "daily=3" in usage and "NOT included" in usage and "80,000" in usage
+
+
+def test_invalid_request_limits_are_refused_before_anything_is_sent(cli, fake, monkeypatch):
+    cli("instruments", "load", "--file", MASTER)
+    with pytest.raises(SystemExit) as e:
+        cli("download", "daily", "--symbols", "SIMALPHA", "--max-requests-per-day", "100001")
+    assert "100,000" in str(e.value) and fake.log == []
+    monkeypatch.setenv("STOCKDATA_MAX_REQUESTS_PER_DAY", "250000")
+    with pytest.raises(ValueError):
+        cli("usage")
+
+
+@pytest.mark.parametrize("flag", ["--max-requests-per-run", "--max-requests-per-day"])
+def test_a_zero_or_negative_limit_is_rejected_not_silently_replaced_by_the_default(cli, fake, flag):
+    cli("instruments", "load", "--file", MASTER)
+    for bad in ("0", "-5"):
+        with pytest.raises(SystemExit) as e:
+            cli("download", "daily", "--symbols", "SIMALPHA", flag, bad)
+        assert "positive" in str(e.value)
+    assert fake.log == []
+
+
+def test_a_dry_run_says_whether_the_plan_fits_the_limits(cli, fake, capsys):
+    cli("instruments", "load", "--file", MASTER)
+    cli("download", "15min", "--all", "--dry-run", "--start-date", "2024-01-01", "--end-date", "2024-06-03",
+        "--max-requests-per-run", "3")
+    out = capsys.readouterr().out
+    assert "this plan needs 6" in out and "only 3 fit now" in out and fake.log == []
+
+
+def test_selfcheck_and_verify_api_stop_cleanly_at_a_limit(cli, fake, capsys):
+    assert cli("selfcheck", "--file", MASTER, "--symbols", "SIMALPHA", "--max-requests-per-run", "1") == 4
+    out = capsys.readouterr().out
+    assert "STOPPED at a request limit" in out and "NOT included" in out
+    assert cli("verify-api", "--symbol", "SIMALPHA", "--security-id", "900001", "--max-requests-per-run", "2") == 4
+    assert "STOPPED" in capsys.readouterr().out
+
+
+# ------------------------------------------------------------------------ refresh through the CLI
+def _daily_rows(cli_run, sec=900001):
+    import duckdb
+    con = duckdb.connect(str(cli_run.data / "stockdata_daily.duckdb"), read_only=True)
+    try:
+        return con.execute("SELECT candle_date, close FROM candles_daily WHERE security_id = ? ORDER BY 1", [sec]).fetchall()
+    finally:
+        con.close()
+
+
+def test_refresh_end_to_end_replaces_revised_history_and_reports_it(cli, fake, capsys):
+    cli("instruments", "load", "--file", MASTER)
+    assert cli("download", "daily", "--symbols", "SIMALPHA", "--start-date", "2024-01-01") == 0
+    before = dict(_daily_rows(cli))
+    sim = fake.instruments[900001]
+    sim.split_on, sim.split_factor = date(2024, 3, 10), 0.5               # the source revises history retroactively
+    capsys.readouterr()
+    assert cli("refresh", "daily", "--symbols", "SIMALPHA", "--start-date", "2024-01-01") == 0
+    out = capsys.readouterr().out
+    assert "no corporate-action factor is applied" in out and "independent split/bonus validation stays pending" in out
+    import re
+    assert int(re.search(r"changed (\d+)", out).group(1)) > 0              # the revised candles were counted
+    after = dict(_daily_rows(cli))
+    assert set(after) == set(before) and after != before
+    assert after[date(2024, 1, 10)] == pytest.approx(before[date(2024, 1, 10)] * 0.5, rel=1e-3)
+    assert after[date(2024, 5, 10)] == before[date(2024, 5, 10)]          # after the revision date: unchanged
+    capsys.readouterr()
+    cli("status", "daily")
+    assert "refresh jobs: {'complete': 1}" in capsys.readouterr().out
+
+
+def test_refresh_requires_explicit_symbols_and_a_sane_range(cli, fake):
+    cli("instruments", "load", "--file", MASTER)
+    cli("download", "daily", "--symbols", "SIMALPHA", "--start-date", "2024-01-01")
+    with pytest.raises(SystemExit) as e:
+        cli("refresh", "daily", "--start-date", "2024-01-01")
+    assert "explicit" in str(e.value)
+    with pytest.raises(SystemExit):
+        cli("refresh", "daily", "--symbols", "SIMALPHA", "--start-date", "2024-02-01", "--end-date", "2024-01-01")
+    with pytest.raises(SystemExit) as e:
+        cli("refresh", "daily", "--symbols", "SIMALPHA", "--start-date", "2024-01-01", "--end-date", "2999-01-01")
+    assert "final day boundary" in str(e.value)
+    with pytest.raises(SystemExit) as e:
+        cli("refresh", "15min", "--symbols", "SIMALPHA", "--start-date", "2024-01-01", "--window-days", "91")
+    assert "90-day cap" in str(e.value)                                    # (instruments load created both databases)
+
+
+def test_refresh_dry_run_sends_nothing_and_changes_nothing(cli, fake, capsys):
+    cli("instruments", "load", "--file", MASTER)
+    cli("download", "daily", "--symbols", "SIMALPHA", "--start-date", "2024-01-01")
+    path = cli.data / "stockdata_daily.duckdb"
+    h = hashlib.sha256(path.read_bytes()).hexdigest()
+    n = len(fake.log)
+    capsys.readouterr()
+    assert cli("refresh", "daily", "--symbols", "SIMALPHA", "--start-date", "2024-01-01", "--dry-run") == 0
+    out = capsys.readouterr().out
+    assert "dry run: 1 request(s)" in out and "new job" in out and "FITS" in out
+    assert len(fake.log) == n and hashlib.sha256(path.read_bytes()).hexdigest() == h
+
+
+def test_refresh_exit_codes_for_held_empty_and_for_a_request_limit(cli, fake, capsys):
+    cli("instruments", "load", "--file", MASTER)
+    cli("download", "daily", "--symbols", "SIMALPHA", "--start-date", "2024-01-01")
+    before = _daily_rows(cli)
+    fake.fail(times=10, status="empty")                                   # an ambiguous empty answer while candles are stored
+    capsys.readouterr()
+    assert cli("refresh", "daily", "--symbols", "SIMALPHA", "--start-date", "2024-01-01") == 2
+    out = capsys.readouterr().out
+    assert "held" in out.lower() and "nothing was deleted" in out
+    assert _daily_rows(cli) == before                                      # no candle was deleted
+    fake.rules.clear()
+    assert cli("refresh", "daily", "--symbols", "SIMALPHA", "--start-date", "2024-01-01", "--max-requests-per-run", "1") == 0

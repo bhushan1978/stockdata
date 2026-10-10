@@ -15,9 +15,12 @@ import logging
 import random
 import time
 from dataclasses import dataclass
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import requests
+
+if TYPE_CHECKING:  # pragma: no cover
+    from stockdata.budget import RequestBudget
 
 log = logging.getLogger("stockdata.dhan")
 
@@ -89,8 +92,10 @@ class DhanClient:
                  limiter: RateLimiter, max_attempts: int = 5, backoff_base: float = 1.0,
                  backoff_cap: float = 60.0, timeout: float = 30.0,
                  session: requests.Session | None = None,
-                 sleep: Callable[[float], None] = time.sleep, rng: random.Random | None = None):
+                 sleep: Callable[[float], None] = time.sleep, rng: random.Random | None = None,
+                 budget: "RequestBudget | None" = None):
         self.base_url = base_url.rstrip("/")
+        self.budget = budget
         self.limiter = limiter
         self.max_attempts = max_attempts
         self.backoff_base, self.backoff_cap, self.timeout = backoff_base, backoff_cap, timeout
@@ -134,6 +139,8 @@ class DhanClient:
         raise AssertionError("unreachable")  # pragma: no cover
 
     def _once(self, path: str, payload: dict) -> tuple[dict, int]:
+        if self.budget is not None:
+            self.budget.acquire()     # counts this attempt (retries included) or raises RequestLimitReached BEFORE sending
         self.requests_sent += 1
         try:
             resp = self.session.post(self.base_url + path, json=payload,

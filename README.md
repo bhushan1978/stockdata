@@ -12,10 +12,11 @@ reference. A file records its timeframe and refuses to be opened as the other on
 Scope is equity history only (no options, expiries or Greeks).
 
 > **Status:** verified live against Dhan on 2026-10-10 for RELIANCE, TCS and INFY (both timeframes, scratch databases):
-> authentication, response schema, date boundaries, epoch/IST conversion, 90-day cap, idempotency, interrupt/resume and
-> integrity all pass (38/38 self-check, 180 tests). **Not yet done:** comparison with NSE corporate-action records, live
-> rate-limit/5xx behaviour, and any full-universe download. See [Status of API assumptions](#status-of-api-assumptions)
-> and [docs/CORPORATE_ACTIONS.md](docs/CORPORATE_ACTIONS.md).
+> authentication, response schema, date boundaries, epoch/IST conversion, 90-day cap, idempotency, interrupt/resume,
+> integrity, and (new) the explicit `refresh` and the request-limit ledger. 245 automated tests pass. **Not yet done:**
+> comparison with NSE corporate-action records (so no corporate action is verified and no adjusted data exists), live
+> 429/5xx behaviour, and any full-universe download. See [Status of API assumptions](#status-of-api-assumptions),
+> [docs/DATA_QUALITY.md](docs/DATA_QUALITY.md) and [docs/CORPORATE_ACTIONS.md](docs/CORPORATE_ACTIONS.md).
 
 ## Setup
 
@@ -69,14 +70,64 @@ Ctrl-C, token expiry or an API outage, run the same command again.** Only the mi
 | daily update | rerun the same command; only the new range (plus a 7-day overlap) is requested |
 | backfill deeper history | rerun with an earlier `--start-date` |
 | re-download a range | `--refetch` (existing candles are kept; any difference is logged in `candle_revisions`) |
+| replace stored candles with Dhan's current data | `refresh` (see below) |
+| `stopped_request_limit` (exit 4) | rerun the same command later, or raise the limit deliberately |
 
 ```bash
 python -m stockdata status daily           # counts and recent runs
 python -m stockdata report 15min --csv     # per-instrument coverage + integrity checks (+ CSV in data/reports/)
 ```
 
-Exit codes: `0` completed, `2` completed with failed/retriable windows, `3` aborted.
+Exit codes: `0` completed, `2` completed with failed/retriable windows (refresh: or held/absent candles to review), `3` aborted, `4` stopped at a request limit.
 DuckDB allows one writer per file, so `report`/`status` cannot open a file while a download on it is running.
+
+### Refreshing history (explicit, audited)
+
+Dhan revises history retroactively, and `download --refetch` only *records* differences. `refresh` replaces stored
+candles for chosen symbols, ONE timeframe and a date range with Dhan's current data, safely:
+
+```bash
+python -m stockdata refresh daily --symbols RELIANCE --start-date 2024-01-01 --end-date 2024-12-31 --dry-run   # plan only
+python -m stockdata refresh daily --symbols RELIANCE --start-date 2024-01-01 --end-date 2024-12-31
+python -m stockdata refresh 15min --symbols RELIANCE,TCS --start-date 2026-01-01                               # to the last final day
+```
+
+* **Validated before anything changes.** Each window is fetched and fully validated first; it is applied in ONE
+  transaction (audit rows, candle updates, additions, job state) or not at all.
+* **Never deletes on doubt.** Authentication failures, server errors, rate limits, request-limit stops, validation failures
+  and **empty responses never change a candle**. An empty answer while candles are stored is `held_empty` for review.
+  (Dhan's daily endpoint reports "no data" as the ambiguous `DH-907` error, which is treated as a failure, never as empty.)
+* **Absent candles are kept.** Stored candles Dhan no longer returns are kept and reported (`missing_kept`). Only
+  `--prune-missing` removes them, after archiving, and only from a validated, non-empty response.
+* **Audited.** Every changed candle is written to `candle_revisions` (old versus new) and to `refresh_changes` with its job id
+  (`revised`, `added`, `missing_kept`, `removed`). Jobs and per-window progress are in `refresh_jobs` / `refresh_windows`.
+* **Resumable and idempotent.** An interrupted refresh resumes the SAME job on the same command and never re-requests
+  windows already applied. Repeating a *completed* refresh starts a new job and leaves the candles untouched when Dhan's
+  data is unchanged. `--retry-failed` retries windows that failed permanently.
+* **Independent.** Each timeframe has its own database and its own jobs; refreshing one never touches the other.
+* **As received.** No corporate-action factor is applied. Independent split/bonus validation stays pending
+  ([docs/CORPORATE_ACTIONS.md](docs/CORPORATE_ACTIONS.md)). Refresh requires explicit `--symbols`/`--security-ids` (no `--all`).
+
+### Request limits
+
+Every outbound API attempt, **retries included**, is counted before it is sent, and the run stops safely when a limit is hit:
+
+| Limit | Default | Change with |
+|---|---|---|
+| per run | 60,000 attempts | `--max-requests-per-run` or `STOCKDATA_MAX_REQUESTS_PER_RUN` |
+| per IST calendar day, all processes and both timeframes | 80,000 attempts | `--max-requests-per-day` or `STOCKDATA_MAX_REQUESTS_PER_DAY` (may not exceed Dhan's 100,000) |
+| request rate | 3 per second (Dhan documents 5) | `--rps` / `STOCKDATA_RPS` |
+
+* The per-day count lives in a shared ledger, `data/request_ledger.sqlite` (set `STOCKDATA_LEDGER` to share one ledger
+  between different data directories). It is SQLite, so separate processes - for example the daily and the 15-minute
+  download running at the same time - update it atomically. It is deliberately outside the two candle databases.
+* **When a limit is reached** the run stops with status `stopped_request_limit` and exit code `4`; the in-flight window is
+  not recorded, every checkpoint is kept, and rerunning the same command resumes without duplicating anything (after IST
+  midnight for the daily limit, or with a deliberately higher one).
+* `download --dry-run` and `refresh --dry-run` print how many requests a plan needs and whether it fits today's headroom;
+  `python -m stockdata usage` shows today's usage per timeframe and recent days. `verify-api` and `selfcheck` count too.
+* **Caveat:** the counter only knows about this application. Other applications using the same Dhan account are **not**
+  counted, while Dhan enforces its documented 100,000 requests/day on the whole account.
 
 ## How it works
 
@@ -107,8 +158,9 @@ and live calls (`verify-api`, `selfcheck`, 2026-10-10, RELIANCE/TCS/INFY).
 
 Daily history from instrument inception; exclusive daily `toDate`; 15-minute interval with up to five years of history and a
 maximum 90-day window; Historical Data limits of 5 requests/second and 100,000 requests/day; official compact and detailed
-instrument-master CSV URLs. The implementation defaults to 3 requests/second. **The 100,000/day cap is not enforced in
-code**: it is account-wide, shared by both downloaders, and retries count; use `download --dry-run` to count a run first.
+instrument-master CSV URLs. The implementation defaults to 3 requests/second and enforces local safety caps of 60,000 per
+run and 80,000 per IST day (see [Request limits](#request-limits)); Dhan's own 100,000/day is account-wide and this
+application cannot see other applications' usage.
 
 ### Confirmed live (2026-10-10)
 
@@ -141,15 +193,15 @@ code**: it is account-wide, shared by both downloaders, and retries count; use `
 * **Negative volume exists.** On Saturday 2022-04-09 12:45 one bar per symbol has negative volume (RELIANCE -35,067,964, followed
   by +52,148,702). It is stored exactly as received and flagged (`negative_volume`) instead of failing the whole 89-day window.
 * **Dhan's history looks already split/bonus-adjusted**: see [docs/CORPORATE_ACTIONS.md](docs/CORPORATE_ACTIONS.md).
-  Consequence: stored history goes stale at the next split/bonus; `--refetch` records the differences in `candle_revisions`
-  but does not overwrite first-seen candles, so a replace/refresh step is still needed before relying on long-lived stores.
+  Consequence: stored history goes stale at the next split/bonus. `--refetch` only records differences; use `refresh`
+  (above) for an explicit, audited replacement. Details of every data finding: [docs/DATA_QUALITY.md](docs/DATA_QUALITY.md).
 
 ### Still unverified
 
 | Behaviour | Why |
 |---|---|
 | Live rate-limit (`429`) and `5xx` behaviour, and live retries | not provoked on purpose; retries are tested only against injected faults |
-| The 100,000 requests/day cap | documented, not enforced or exercised |
+| Dhan's own 100,000/day cap and what Dhan does at the limit | documented; the local 80,000/day cap exists to stay well clear, and was exercised with simulated traffic only |
 | Whether Dhan **volumes** are adjusted as well as prices | strongly suggested by continuity; needs NSE raw volumes |
 | Every corporate-action ex-date, ratio and the raw/adjusted conclusion | NSE hosts did not respond (see corporate actions) |
 | Detailed instrument master (ISIN, other type codes) | only its URL was checked; needed for ISIN-based event mapping |
@@ -161,7 +213,7 @@ code**: it is account-wide, shared by both downloaders, and retries count; use `
 pip install -r requirements-dev.txt && pytest -q
 ```
 
-180 tests run against `tests/fake_dhan.py`, a *synthetic* local server (instruments are `SIM*`). They demonstrate the
+245 tests run against `tests/fake_dhan.py`, a *synthetic* local server (instruments are `SIM*`). They demonstrate the
 mechanics (boundaries, timestamps, idempotency, retry, resume, atomic commit, isolation, corporate-action methodology on
 constructed series). They are not evidence about real Dhan or NSE data.
 
@@ -169,14 +221,16 @@ constructed series). They are not evidence about real Dhan or NSE data.
 
 * Live-verified on three symbols only. Corporate-action verification against NSE is **pending** (NSE hosts did not respond),
   no corporate action is verified, and no adjusted data has been generated. Dhan's history appears to be *already*
-  adjusted, so adjustment stays disabled; see [docs/CORPORATE_ACTIONS.md](docs/CORPORATE_ACTIONS.md).
-* Stored history goes stale when Dhan adjusts retroactively after a future split/bonus. Differences are detected and logged
-  (`candle_revisions`) but there is no replace/refresh command yet.
+  adjusted, so adjustment stays disabled and nothing here adds a price or volume adjustment; see
+  [docs/CORPORATE_ACTIONS.md](docs/CORPORATE_ACTIONS.md).
+* Stored history goes stale when Dhan adjusts retroactively after a future split/bonus. Differences are detected
+  (`--refetch`, the 7-day overlap) but nothing refreshes automatically: run `refresh` for the affected symbol and range.
+  Spotting WHICH symbols were revised is still a manual step (`candle_revisions`).
+* The request counter only covers this application; other users of the same Dhan account are invisible to it.
 * The universe is whatever `config/universe.toml` selects (NSE `EQ` equity shares, 2,351 today); delisted instruments are not in
   today's master, so their history is not downloaded.
 * The compact master has no ISIN; ISIN-based event mapping needs the detailed master.
 * Recent intraday sessions (from 2026-08-03) end at 15:15 in every interval, and some older periods carry a 15:30 bar, so
-  15-minute volume is not guaranteed to add up to the daily volume.
-* The 100,000 requests/day cap is not enforced in code.
+  15-minute volume is not guaranteed to add up to the daily volume. Missing candles are never synthesized.
 * One writer per DuckDB file; requests are sequential (by design, to stay far below rate limits).
 * The `PRIMARY KEY` indexes make the ~60M-row 15-minute table memory-hungry during bulk loading on small machines.
