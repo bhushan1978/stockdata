@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import logging
 import sys
 from datetime import date, datetime, timedelta
@@ -25,7 +26,7 @@ from stockdata import live
 from stockdata.refresh import RefreshOptions, Refresher
 from stockdata.reports import format_report, status_text
 from stockdata.timeframes import TIMEFRAMES, Timeframe, get_timeframe
-from stockdata.timeutil import cutoff_exclusive, ist_now, to_midnight
+from stockdata.timeutil import cutoff_exclusive, ist_now, to_midnight, utcnow
 
 log = logging.getLogger("stockdata")
 
@@ -225,6 +226,54 @@ def cmd_download(args, settings: Settings) -> int:
             print(f"{len(out)} failed/retriable window(s) outstanding; rerun the same command to retry the "
                   "retriable ones (add --retry-failed for permanent failures). See `report`.")
         return EXIT_CODES.get(stats["status"], 3)
+
+
+# ------------------------------------------------------------------ diagnose
+def cmd_diagnose(args, settings: Settings) -> int:
+    """Read-only: ask for what a download would ask for, analyse the RAW answer and say what is in it. Stores no candle."""
+    from stockdata import diagnose
+    from stockdata.providers.errors import ProviderError
+    tf = get_timeframe(args.timeframe)
+    prov = provider_name(settings, args)
+    settings = apply_limit_args(settings, args)
+    path = db_path(settings, tf)
+    if not path.exists():
+        raise SystemExit(f"{path} does not exist; run `instruments load` first")
+    symbols = csv_list(args.symbols) or []
+    if not symbols or len(symbols) > diagnose_max_symbols():
+        raise SystemExit(f"name 1 to {diagnose_max_symbols()} symbols with --symbols (each costs 1 to 3 counted requests)")
+    with CandleDB(tf, path, read_only=True) as db:
+        insts = db.get_instruments(symbols=[x.upper() for x in symbols])
+    missing = sorted({x.upper() for x in symbols} - {i.symbol.upper() for i in insts})
+    if missing:
+        raise SystemExit(f"not in the loaded universe: {', '.join(missing)}")
+    adapter = get_provider(prov)
+    client = make_client(settings, tf.name, max_attempts=3, provider=prov)
+    end = args.end_date and datetime.combine(args.end_date, datetime.min.time()) or cutoff_exclusive(ist_now(), 18).replace(tzinfo=None)
+    default_start = datetime.combine(config.DAILY_HISTORY_START, datetime.min.time()) if not tf.is_intraday else end - timedelta(days=tf.max_window_days - 1)
+    start = args.start_date and datetime.combine(args.start_date, datetime.min.time()) or default_start
+    out_dir = settings.data_dir / "diagnostics"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"{tf.name}: {len(insts)} instrument(s), window [{start:%Y-%m-%d}, {end:%Y-%m-%d}), provider {adapter.label}; nothing is stored\n")
+    opts = RefreshOptions(start=start, end=end, window_days=tf.default_window_days)
+    for inst in insts:
+        def fetch(s, e, inst=inst):
+            from stockdata.windows import Window
+            return adapter.fetch(client, inst, tf, Window(s, e), opts).body
+        report = diagnose.run_diagnosis(fetch, tf, start, end)
+        raw = report.pop("raw", None)
+        print(diagnose.render(inst.symbol, inst.security_id, report))
+        if raw is not None:
+            file = out_dir / f"{inst.symbol}_{tf.name}_{utcnow():%Y%m%dT%H%M%S}.json"
+            file.write_text(json.dumps({"symbol": inst.symbol, "security_id": inst.security_id, "window": report["window"], "response": raw}), encoding="utf-8")
+            print(f"   raw response saved to {file} (local only; data/ is not committed)")
+        print()
+    print(client.budget.summary())
+    return 0
+
+
+def diagnose_max_symbols() -> int:
+    return 10
 
 
 # -------------------------------------------------------------------- update
@@ -493,6 +542,16 @@ def build_parser() -> argparse.ArgumentParser:
     add_provider_arg(p)
     add_limit_args(p)
     p.set_defaults(func=cmd_download)
+
+    p = sub.add_parser("diagnose", help="READ-ONLY: show what the provider returns for chosen instruments (repeated dates, fractional volumes, "
+                                        "'no data') without storing anything; 1 to 3 counted requests each")
+    p.add_argument("timeframe", choices=list(TIMEFRAMES))
+    p.add_argument("--symbols", required=True, help="comma list (at most 10), e.g. AQYLON,SANOFI,BELDING")
+    p.add_argument("--start-date", type=parse_date, help="window start (default: the whole history for daily, the last 89 days for 15-minute)")
+    p.add_argument("--end-date", type=parse_date, help="exclusive window end (default: the last final day boundary)")
+    add_provider_arg(p)
+    add_limit_args(p)
+    p.set_defaults(func=cmd_diagnose)
 
     p = sub.add_parser("update", help="bring stored candles up to date from each instrument's last candle (never a history "
                                       "download); or poll today's completed 15-minute bars into the provisional table")

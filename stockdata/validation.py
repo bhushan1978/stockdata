@@ -155,10 +155,13 @@ def _resolve_duplicates(df: pd.DataFrame, ist: pd.Series, key: pd.Series):
             notes.append((k, "duplicate_conflict", f"{len(grp)} different candles for one key, none stored: {rows}"[:480]))
     distinct = key.nunique()
     if len(conflicts) > MAX_CONFLICTING_KEYS or len(conflicts) * 2 > distinct:
-        first = ", ".join(str(c)[:19] for c in conflicts[:3])
+        pairs = [g for _, g in df[dup].groupby(key[dup], sort=True) if len(g[list(PRICE_COLS) + ["volume"]].drop_duplicates()) > 1]
+        ratio = [float(g["close"].iloc[1] / g["close"].iloc[0]) for g in pairs if g["close"].iloc[0] > 0]
+        shape = f"; second/first close ratio median {sorted(ratio)[len(ratio) // 2]:.4g}" if ratio else ""
         raise ValidationError("duplicate_timestamps",
-                              f"{len(conflicts)} candle keys carry different candles in one response (first: {first}); "
-                              "looks like a time-base problem, so nothing was stored")
+                              f"{len(conflicts)} dates carry different candles in one response (from {str(conflicts[0])[:10]} to "
+                              f"{str(conflicts[-1])[:10]}{shape}): the response seems to hold overlapping series, so nothing was stored. "
+                              "Run `python -m stockdata diagnose` for this instrument to see what the provider returned")
     out = pd.DataFrame(notes, columns=["candle_key", "kind", "detail"])
     return (df[keep].reset_index(drop=True), ist[keep].reset_index(drop=True), key[keep].reset_index(drop=True), out)
 

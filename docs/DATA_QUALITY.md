@@ -83,3 +83,25 @@ candle is ever created, changed or filled in):
 * **Provider disagreements** — candles where two providers (or two fetches) gave different values; the stored value is kept.
 * **Instrument lifecycle** — renames, symbols used by different securities, one ISIN on several security ids, new listings and
   instruments that left the master. Candles belong to a security id, never to a symbol.
+
+## When the validator refuses a response: `diagnose`
+
+A refused window is stored as `failed` and nothing is written for it. To see WHY, without storing anything, ask for what a download would ask
+for and read the raw answer:
+
+```
+.venv\Scripts\python.exe -m stockdata diagnose daily --symbols AQYLON,SANOFI,BELDING
+```
+
+It makes 1 to 3 counted requests per symbol (at most 10 symbols), prints what the response contains, and saves the raw response under
+`data\diagnostics\` (local only, never committed). It reports:
+
+* **repeated dates** - how many, from when to when, identical or different, whether the two copies sit next to each other or in two
+  separate blocks, and whether their prices differ by a constant factor (one adjusted and one unadjusted series) or not (two different
+  price histories); then it asks for a small window around the first repeated date and for the recent days, to show whether the problem
+  belongs to the whole-history request or to the data itself;
+* **fractional volumes** - how many candles, from when to when, example values, and how much rounding them would change the total;
+* **"no data" (DH-907)** - and whether the last 60 days of the same instrument return candles (then the instrument has data and the
+  whole-history request is what fails) or not (then there may be no data at all).
+
+Nothing about a refused response is guessed: no rule for storing it is added until its real shape is known.
