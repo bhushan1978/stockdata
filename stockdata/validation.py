@@ -28,6 +28,9 @@ SYSTEMATIC_FRACTION = 0.05
 SYSTEMATIC_MIN_ROWS = 20
 SYSTEMATIC_TINY_FRACTION = 0.5
 MAX_CONFLICTING_KEYS = 5        # more candle keys than this with DIFFERENT candles in one response: reject it all
+# Shares are whole numbers, so a fractional volume is a derived value (seen live: SANOFI daily, 85% of candles, e.g. 22355.1). It is rounded
+# to the nearest whole share, and flagged per candle, only when that moves the response's total volume by less than this share.
+MAX_ROUNDING_SHARE = 0.001
 # Informational findings (a genuine special weekend session) must never make a window "systematic".
 SYSTEMATIC_KINDS = {"ohlc_relation", "non_positive_price", "negative_volume", "outside_session", "off_grid",
                     "daily_timestamp_not_midnight_ist"}
@@ -70,6 +73,24 @@ def _as_integers(values: pd.Series, name: str, *, non_negative: bool = False) ->
     return num.astype("int64")
 
 
+def _volumes(values: pd.Series) -> tuple[pd.Series, pd.Series]:
+    """Whole-share volumes and the volumes as received. A fractional volume is rounded only when that is immaterial (see
+    MAX_ROUNDING_SHARE); otherwise the response is refused, as every non-integral volume used to be."""
+    num = pd.to_numeric(values, errors="coerce")
+    if num.isna().any() or not np.isfinite(num.to_numpy(dtype="float64")).all():
+        raise ValidationError("non_numeric_volume", "volume contains null or non-numeric values")
+    frac = num != np.floor(num)
+    if not frac.any():
+        return num.astype("int64"), num                      # whole numbers: stored exactly as received
+    total = float(num.abs().sum())
+    moved = float((num[frac] - np.rint(num[frac])).abs().sum())
+    if total <= 0 or moved / total >= MAX_ROUNDING_SHARE:
+        share = f"{moved / total:.4%}" if total > 0 else "all of it"
+        raise ValidationError("non_integer_volume", f"volume contains non-integral values ({int(frac.sum())} of {len(num)}) and rounding "
+                              f"them would change the total volume by {share} (the limit is {MAX_ROUNDING_SHARE:.2%}); nothing was stored")
+    return np.rint(num).astype("int64"), num
+
+
 def validate_response(tf: Timeframe, body, window: Window) -> Validated:
     if not isinstance(body, dict) or any(k not in body for k in REQUIRED_KEYS):
         present = sorted(body) if isinstance(body, dict) else type(body).__name__
@@ -89,7 +110,7 @@ def validate_response(tf: Timeframe, body, window: Window) -> Validated:
         if s.isna().any() or not np.isfinite(s.to_numpy(dtype="float64")).all():
             raise ValidationError("non_numeric_price", f"{col} contains null or non-numeric values")
         df[col] = s.astype("float64")
-    df["volume"] = _as_integers(df["volume"], "volume")      # negatives are kept and flagged, see _find_anomalies
+    df["volume"], df["volume_received"] = _volumes(df["volume"])      # negatives are kept and flagged, see _find_anomalies
     df["epoch_raw"] = _as_integers(df["timestamp"], "timestamp")
     try:
         ist = epoch_to_ist_naive(df["epoch_raw"])
@@ -110,8 +131,12 @@ def validate_response(tf: Timeframe, body, window: Window) -> Validated:
         )
 
     anomalies = _find_anomalies(tf, df, ist, key)
-    if len(duplicate_notes):
-        anomalies = pd.concat([anomalies, duplicate_notes], ignore_index=True)
+    rounded = df["volume_received"] != df["volume"]
+    rounding_notes = pd.DataFrame({"candle_key": key[rounded].to_numpy(), "kind": "volume_rounded",
+                                   "detail": "volume " + df.loc[rounded, "volume_received"].astype(str) + " stored as " + df.loc[rounded, "volume"].astype(str)})
+    extra = [n for n in (duplicate_notes, rounding_notes) if len(n)]
+    if extra:
+        anomalies = pd.concat([anomalies, *extra], ignore_index=True)
         anomalies["candle_key"] = anomalies["candle_key"].astype("datetime64[us]")
     flagged = anomalies.loc[anomalies["kind"].isin(SYSTEMATIC_KINDS), "candle_key"].nunique()
     n = len(df)

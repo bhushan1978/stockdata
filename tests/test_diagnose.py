@@ -127,6 +127,21 @@ def test_a_no_data_answer_is_followed_by_one_probe_of_the_recent_days():
     assert "no data for this instrument at all" in text
 
 
+def test_the_no_data_report_names_the_reviewed_empty_command_only_when_recent_days_are_also_empty():
+    def nothing(start, end):
+        raise PermanentError("HTTP 400 DH-907: no data", http_status=400, error_code="DH-907")
+
+    text = diagnose.render("BELDING", 766517, diagnose.run_diagnosis(nothing, DAILY, datetime(1990, 1, 1), datetime(2026, 10, 11)))
+    assert "--security-ids 766517 --retry-failed --empty-error-codes DH-907" in text and "RUNBOOK" in text
+
+    def recent_only(start, end):
+        if (end - start).days > 100:
+            raise PermanentError("HTTP 400 DH-907: no data", http_status=400, error_code="DH-907")
+        return body(series(days(5)))
+
+    assert "--empty-error-codes" not in diagnose.render("X", 1, diagnose.run_diagnosis(recent_only, DAILY, datetime(1990, 1, 1), datetime(2026, 10, 11)))
+
+
 def test_the_validators_refusal_says_what_it_found_and_points_to_the_diagnosis():
     ds = days(30)
     win = Window(datetime(2024, 1, 1), datetime(2025, 1, 1))
@@ -160,3 +175,68 @@ def test_the_command_stores_nothing_saves_the_raw_response_and_costs_one_request
         run("diagnose", "daily", "--symbols", "NOSUCH")
     with pytest.raises(SystemExit):
         run("diagnose", "daily", "--symbols", ",".join(f"S{i}" for i in range(11)))
+
+
+def overlapping(n_before=10, n_pairs=40, n_after=10, ratios=((0, 5.0),), flip_every=7, single_inside=None, start=100.0):
+    """Single candles, then a stretch where every date carries two candles (one series is `ratio` times the other, the copy order flips
+    every `flip_every` dates), then single candles again. Returns (rows, dates). `ratios`: (index in the stretch, ratio from there on)."""
+    ds = days(n_before + n_pairs + n_after)
+    rows = []
+    for i, d in enumerate(ds):
+        c = start + i
+        row = lambda price: (d, price, price + 1, price - 1, price, 1000, 0, 0)       # noqa: E731
+        if i < n_before or i >= n_before + n_pairs:
+            rows.append(row(c))
+            continue
+        j = i - n_before
+        ratio = [r for at, r in ratios if at <= j][-1]
+        if single_inside == j:
+            rows.append(row(c * ratio))
+            continue
+        lo, hi = row(c), row(c * ratio)
+        rows += [hi, lo] if j % flip_every == flip_every - 1 else [lo, hi]
+    return rows, ds
+
+
+def test_overlapping_series_are_told_apart_by_level_because_the_copy_order_is_not_reliable():
+    rows, ds = overlapping(ratios=((0, 15.0), (20, 10.0)), single_inside=30)
+    a = diagnose.analyze_body(DAILY, body(rows))
+    t = a["duplicates"]["tracks"]
+    pairs = 40 - 1                                                                          # one date inside the stretch has a single copy
+    assert t["dates"] == pairs and 0 < t["first_copy_is_lower_on"] < pairs                  # the first copy is sometimes the higher price
+    seg = t["ratio_segments"]
+    assert seg["count"] == 2 and [round(x["high_over_low"]) for x in seg["listed"]] == [15, 10]
+    assert seg["listed"][1]["from"][:10] == str(ds[10 + 20])[:10]                           # the ratio changes exactly where it was built to
+    assert t["big_daily_moves"]["lower"]["count"] == 0
+    assert t["big_daily_moves"]["higher"]["count"] == 1 and t["big_daily_moves"]["higher"]["first"][0]["date"][:10] == str(ds[10 + 20])[:10]
+    e = t["edges"]
+    assert e["last_single_before"]["close"] == 109.0 and e["first_single_after"]["close"] == 100.0 + 50
+    assert t["single_candles_inside"] == {"count": 1, "nearer_to_lower": 0, "nearer_to_higher": 1}
+    text = " | ".join(diagnose.verdict({"window": ["a", "b"], "requests": 1, "analysis": a}))
+    assert "NOT reliable" in text and "would mix the two series" in text and "changes 1 time(s)" in text
+    assert "second/first close ratio" not in text                                           # the position-based ratio is meaningless when the order flips
+
+
+def test_a_constant_factor_between_the_two_series_is_reported_as_constant():
+    rows, _ = overlapping(ratios=((0, 5.0),), flip_every=10_000)
+    a = diagnose.analyze_body(DAILY, body(rows))
+    t = a["duplicates"]["tracks"]
+    assert t["first_copy_is_lower_on"] == t["dates"] and t["ratio_segments"]["count"] == 1
+    text = " | ".join(diagnose.verdict({"window": ["a", "b"], "requests": 1, "analysis": a}))
+    assert "always the lower-priced one" in text and "constant 5x the lower one" in text
+    assert "CONSTANT factor" in text                                                         # the existing second/first line still applies when the order is stable
+
+
+def test_a_stretch_at_the_start_of_the_response_has_no_single_candle_before_it():
+    rows, _ = overlapping(n_before=0, n_pairs=20, n_after=0)
+    t = diagnose.analyze_body(DAILY, body(rows))["duplicates"]["tracks"]
+    assert "last_single_before" not in t["edges"] and "first_single_after" not in t["edges"] and "single_candles_inside" not in t
+    text = " | ".join(diagnose.verdict({"window": ["a", "b"], "requests": 1, "analysis": {**diagnose.analyze_body(DAILY, body(rows))}}))
+    assert "begins with the first candle" in text and "no single candle follows" in text
+
+
+def test_the_rendered_report_prints_the_track_lines_without_dumping_the_raw_structure():
+    rows, _ = overlapping(ratios=((0, 15.0), (20, 10.0)))
+    report = {"window": ["2003-01-01", "2026-10-11"], "requests": 3, "analysis": diagnose.analyze_body(DAILY, body(rows))}
+    text = diagnose.render("AQYLON", 23365, report)
+    assert "told apart by level" in text and "ratio_segments" not in text and "tracks" not in text

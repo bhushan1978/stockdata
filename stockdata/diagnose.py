@@ -21,6 +21,9 @@ from stockdata.validation import REQUIRED_KEYS
 
 PROBE_DAYS = 60
 SAMPLE = 3
+RATIO_STEP = 0.05          # the higher/lower price ratio moved by more than this: a new segment
+JUMP = 1.3                 # a day-to-day move beyond +30% / -23% inside one series is reported
+MAX_SEGMENTS = 8
 
 
 def _iso(x) -> str | None:
@@ -85,6 +88,7 @@ def analyze_body(tf, body) -> dict:
             info["copy_time_of_day"] = {"first": {str(k): int(v) for k, v in ist.iloc[[a for _, a, _ in pairs]].dt.strftime("%H:%M:%S").value_counts().head(2).items()},
                                         "second": {str(k): int(v) for k, v in ist.iloc[[b for _, _, b in pairs]].dt.strftime("%H:%M:%S").value_counts().head(2).items()}}
             info["samples"] = [{"key": _iso(k), "first": _row(df, num, ts, ist, a), "second": _row(df, num, ts, ist, b)} for k, a, b in pairs[:SAMPLE]]
+            info["tracks"] = _tracks(key, num["close"], dup, pairs)
         out["duplicates"] = info
 
     vol = num["volume"]
@@ -97,6 +101,52 @@ def analyze_body(tf, body) -> dict:
                                     "rounding_would_change_total_by": round(err / total, 8) if total else None}
     out["negative_volume"] = int((vol < 0).sum())
     out["zero_volume"] = int((vol == 0).sum())
+    return out
+
+
+def _tracks(key, close, dup, pairs) -> dict:
+    """The two overlapping series told apart by LEVEL: inside the response their order is not reliable (the first copy is sometimes the
+    higher price, sometimes the lower). Reports where the ratio between them changes, whether either series jumps, and how each joins the
+    dates that appear only once. Facts only: it does not say which series is right."""
+    keys = pd.DatetimeIndex([k for k, _, _ in pairs])
+    ca = np.array([close[a] for _, a, _ in pairs], dtype=float)
+    cb = np.array([close[b] for _, _, b in pairs], dtype=float)
+    ok = (ca > 0) & (cb > 0)
+    if not ok.any():
+        return {}
+    keys, ca, cb = keys[ok], ca[ok], cb[ok]
+    lo, hi = np.minimum(ca, cb), np.maximum(ca, cb)
+    out: dict = {"dates": int(len(keys)), "first_copy_is_lower_on": int((ca < cb).sum())}
+
+    ratio = hi / lo
+    smooth = pd.Series(ratio).rolling(5, center=True, min_periods=1).median().to_numpy()      # one odd day does not start a segment
+    cuts = [0, *[i for i in range(1, len(smooth)) if abs(smooth[i] / smooth[i - 1] - 1) > RATIO_STEP], len(smooth)]
+    segments = [{"from": _iso(keys[s]), "to": _iso(keys[e - 1]), "dates": e - s, "high_over_low": round(float(np.median(ratio[s:e])), 3)}
+                for s, e in zip(cuts, cuts[1:])]
+    out["ratio_segments"] = {"count": len(segments), "listed": segments[:MAX_SEGMENTS]}
+
+    jumps = {}
+    for name, track in (("lower", lo), ("higher", hi)):
+        move = track[1:] / track[:-1]
+        big = np.where((move > JUMP) | (move < 1 / JUMP))[0]
+        jumps[name] = {"count": int(len(big)), "first": [{"date": _iso(keys[i + 1]), "move": round(float(move[i]), 3)} for i in big[:3]]}
+    out["big_daily_moves"] = jumps
+
+    single = pd.Series(close[~dup].to_numpy(dtype=float), index=pd.DatetimeIndex(key[~dup])).sort_index()
+    before, after = single[single.index < keys[0]], single[single.index > keys[-1]]
+    edges = {"first_repeated": {"date": _iso(keys[0]), "lower": float(lo[0]), "higher": float(hi[0])},
+             "last_repeated": {"date": _iso(keys[-1]), "lower": float(lo[-1]), "higher": float(hi[-1])}}
+    if len(before):
+        edges["last_single_before"] = {"date": _iso(before.index[-1]), "close": float(before.iloc[-1])}
+    if len(after):
+        edges["first_single_after"] = {"date": _iso(after.index[0]), "close": float(after.iloc[0])}
+    out["edges"] = edges
+
+    inside = single[(single.index > keys[0]) & (single.index < keys[-1])]
+    if len(inside):
+        prev = keys.searchsorted(inside.index, side="right") - 1
+        near_lo = np.abs(np.log(inside.to_numpy() / lo[prev])) < np.abs(np.log(inside.to_numpy() / hi[prev]))
+        out["single_candles_inside"] = {"count": int(len(inside)), "nearer_to_lower": int(near_lo.sum()), "nearer_to_higher": int((~near_lo).sum())}
     return out
 
 
@@ -150,6 +200,32 @@ def run_diagnosis(fetch: Fetch, tf, start: datetime, end: datetime) -> dict:
     return report
 
 
+def _track_lines(t: dict) -> list[str]:
+    n, k = t["dates"], t["first_copy_is_lower_on"]
+    out = [f"the order of the two copies is NOT reliable: the first copy is the lower-priced one on {k} of {n} repeated dates, so \"keep the first\" "
+           "or \"keep the last\" would mix the two series" if 0 < k < n else
+           f"the first copy is {'always' if k == n else 'never'} the lower-priced one ({n} repeated dates)"]
+    seg = t["ratio_segments"]
+    if seg["count"] == 1:
+        out.append(f"told apart by level, the higher series is a constant {seg['listed'][0]['high_over_low']:g}x the lower one on every repeated date")
+    else:
+        listed = "; ".join(f"{x['from'][:10]} to {x['to'][:10]} x{x['high_over_low']:g}" for x in seg["listed"])
+        out.append(f"told apart by level, the higher/lower price ratio changes {seg['count'] - 1} time(s): {listed}" + (" ..." if seg["count"] > len(seg["listed"]) else ""))
+    mv = t["big_daily_moves"]
+    shown = "; ".join(f"{name} {m['count']}" + ("".join(f" ({x['date'][:10]} x{x['move']:g})" for x in m["first"])) for name, m in mv.items())
+    out.append(f"day-to-day moves beyond +30%/-23% inside one series: {shown}")
+    e = t["edges"]
+    fr, lr, b, a = e["first_repeated"], e["last_repeated"], e.get("last_single_before"), e.get("first_single_after")
+    out.append((f"just before the repeated stretch the single series closed at {b['close']:g} ({b['date'][:10]}); " if b else "the repeated stretch begins with the first candle; ")
+               + f"on {fr['date'][:10]} the two series close at {fr['lower']:g} (lower) and {fr['higher']:g} (higher)")
+    out.append(f"on {lr['date'][:10]} (last repeated date) they close at {lr['lower']:g} and {lr['higher']:g}" +
+               (f"; the next single candle ({a['date'][:10]}) closes at {a['close']:g}" if a else "; no single candle follows"))
+    si = t.get("single_candles_inside")
+    if si:
+        out.append(f"{si['count']} date(s) inside the stretch appear only once: {si['nearer_to_lower']} are nearer the lower series, {si['nearer_to_higher']} the higher")
+    return out
+
+
 def verdict(report: dict) -> list[str]:
     """Plain-language reading of a report (what it shows; never a guess presented as fact)."""
     out: list[str] = []
@@ -177,11 +253,14 @@ def verdict(report: dict) -> list[str]:
         if d["conflicting"]:
             out.append("the two copies sit " + ("next to each other in the response" if d["adjacent_copies_share"] > 0.9 else
                        f"far apart in the response (median {d['median_row_gap_between_copies']:.0f} rows): two blocks, not interleaved"))
+            t = d.get("tracks")
             r = d.get("close_ratio_second_over_first")
-            if r:
+            if r and not (t and 0 < t["first_copy_is_lower_on"] < t["dates"]):          # when the order flips, a first/second ratio means nothing
                 out.append(f"second/first close ratio: median {r['median']}, range {r['min']} to {r['max']}; "
                            + ("a CONSTANT factor (e.g. one adjusted and one unadjusted series)" if r["share_within_1pct_of_median"] > 0.9 and abs(r["median"] - 1) > 0.02
                               else "NOT a constant factor: these look like two different price histories"))
+            if t:
+                out += _track_lines(t)
         probes = report.get("probes", {})
         around, recent = probes.get("around_the_first_repeated_date"), probes.get("most_recent_days")
         for label, p in (("a small window around the first repeated date", around), ("the most recent days", recent)):
@@ -209,9 +288,13 @@ def render(symbol: str, security_id: int, report: dict) -> str:
         lines.append(f"rows {a['rows']:,} · distinct dates/times {a['unique_keys']:,} · {a['first']} to {a['last']} · times of day {a['time_of_day']}")
     d = (a or {}).get("duplicates")
     if d:
-        lines.append(f"repeated: {json.dumps({k: v for k, v in d.items() if k not in ('samples',)}, default=str)}")
+        lines.append(f"repeated: {json.dumps({k: v for k, v in d.items() if k not in ('samples', 'tracks')}, default=str)}")
         for s in d.get("samples", []):
             lines.append(f"  {s['key']}: first {s['first']}")
             lines.append(f"  {' ' * len(str(s['key']))}  second {s['second']}")
     lines += ["-> " + v for v in verdict(report)]
+    probe = report.get("recent_probe")
+    if report.get("error", {}).get("kind") == "rejected" and probe is not None and ("error" in probe or not probe.get("rows")):
+        lines.append(f"   if you agree this instrument has no daily data, record it as empty (reviewed ids only, never on a broad run): "
+                     f"python -m stockdata download daily --security-ids {security_id} --retry-failed --empty-error-codes DH-907   (docs/RUNBOOK.md, section 6)")
     return "\n".join(lines)

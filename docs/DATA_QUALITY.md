@@ -59,6 +59,11 @@ For RELIANCE, TCS and INFY the number of bars per session depends on the date:
   shows up as a gap, the rest of the response is stored, and every raw row is written into the `duplicate_conflict` flag so you can decide
   (Data Quality → Flagged candles). More than 5 such keys in one response is treated as a time-base problem and the whole window fails.
   Instruments whose window failed earlier with `duplicate_timestamps` need *Retry failed windows* after this change: a plain rerun skips them.
+* **Volumes can have a fractional part** (seen live: SANOFI daily, 4,891 of 5,734 candles from 2003-09-05 to 2024-06-12, e.g. 22355.1; shares are
+  whole numbers, so this is a derived value, most likely from an adjustment applied by the provider). A response is stored with each such volume rounded
+  to the nearest whole share **only if rounding moves the response's total volume by less than 0.1%** (SANOFI: 0.0011%); every rounded candle gets a
+  `volume_rounded` flag with the value as received, so nothing is hidden. If rounding would move the total by 0.1% or more (tiny volumes), the window
+  fails as `non_integer_volume` and nothing is stored. Instruments that failed earlier with `non_integer_volume` need *Retry failed windows*.
 * **"No data" is signalled differently per endpoint**: intraday returns HTTP 200 with empty arrays; daily returns `HTTP 400 DH-907`
   ("incorrect parameters or no data present"), which cannot be told apart from a bad request.
 * **History starts at Dhan's own data start**, not the exchange listing: RELIANCE 2002-01-01, INFY 2003-09-05, TCS 2004-08-25 (daily).
@@ -100,8 +105,29 @@ It makes 1 to 3 counted requests per symbol (at most 10 symbols), prints what th
   separate blocks, and whether their prices differ by a constant factor (one adjusted and one unadjusted series) or not (two different
   price histories); then it asks for a small window around the first repeated date and for the recent days, to show whether the problem
   belongs to the whole-history request or to the data itself;
+  When the copies carry different prices it also tells the two series apart **by level** (the order inside the response is not reliable), and
+  reports where the ratio between them changes, whether either series has a day-to-day move beyond +30%/-23%, how each joins the single
+  candles just before and after the stretch, and which series the single candles inside the stretch sit nearer to. It states facts; it does not say
+  which series is right;
 * **fractional volumes** - how many candles, from when to when, example values, and how much rounding them would change the total;
 * **"no data" (DH-907)** - and whether the last 60 days of the same instrument return candles (then the instrument has data and the
   whole-history request is what fails) or not (then there may be no data at all).
 
+For a "no data" instrument the report ends with the exact reviewed-ids command from `docs/RUNBOOK.md` section 6 (only when the last 60 days are
+empty too).
+
 Nothing about a refused response is guessed: no rule for storing it is added until its real shape is known.
+
+### What it showed on 2026-10-10 (Dhan daily, real responses)
+
+| Instrument | Finding |
+|---|---|
+| SHRIRAMFIN | 821 dates (2005-01-03 to 2008-04-11) carry two candles; the copies sit next to each other; their close ratio is 5.0 on 99.9% of the dates; volumes are identical; a 60-day window around 2005-01-03 repeats too, the last 60 days do not |
+| AQYLON | 3,330 dates (2011-01-03 to 2026-02-09) carry two candles, next to each other; volumes identical; the first/second close ratio runs from 0.066 to 15.2 (median 10), so the order of the copies is not stable; a 60-day window around 2011-01-03 repeats too, the last 60 days do not |
+| SANOFI | no repeated dates; 85.3% of candles have a fractional volume (2003-09-05 to 2024-06-12); rounding changes the total by 0.0011% |
+| BELDING | `DH-907` for the whole history and for the last 60 days |
+
+Consequences: the repeats are in the provider's data (a small window repeats them), not an artifact of asking for the whole history; there is
+no safe positional rule ("keep the first" or "keep the last") when the order of the copies changes; and which of the two series is the right one
+cannot be read from the response alone. **Instruments like these stay failed with `duplicate_timestamps` and nothing is stored for them until a
+rule is chosen from evidence** (see `diagnose` output, an independent price source such as an NSE close, or another provider).

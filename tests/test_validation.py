@@ -251,3 +251,51 @@ def test_a_response_with_a_conflicting_duplicate_commits_cleanly_and_the_integri
         assert kinds == {"duplicate_conflict": 1}
         assert db.con.execute("SELECT status FROM download_windows").fetchone()[0] == "complete"
         assert all(c.ok for c in integrity_checks(db))
+
+
+def _daily_rows(volumes, close=100.0):
+    return [(datetime(2024, 5, 6) + timedelta(days=i), close, close + 1, close - 1, close, v) for i, v in enumerate(volumes)]
+
+
+def test_fractional_volume_that_is_immaterial_is_rounded_and_each_candle_is_flagged_with_the_received_value():
+    """Seen live (SANOFI daily): 85% of candles had volumes like 22355.1; rounding changed the total by 0.0011%."""
+    v = validate_response(DAILY, body(_daily_rows([22355.1, 194594.4, 85410.15, 1_000_000, 700_000])), WIN_D)
+    assert list(v.candles["volume"]) == [22355, 194594, 85410, 1_000_000, 700_000] and str(v.candles["volume"].dtype) == "int64"
+    flags = v.anomalies[v.anomalies["kind"] == "volume_rounded"]
+    assert list(flags["candle_key"].dt.day) == [6, 7, 8]                    # only the candles that were changed
+    assert flags["detail"].iloc[0] == "volume 22355.1 stored as 22355" and "194594.4" in flags["detail"].iloc[1]
+    assert not v.anomalies["kind"].isin(["duplicate_dropped", "duplicate_conflict"]).any()
+
+
+def test_fractional_volume_that_would_change_the_total_materially_is_still_refused():
+    with pytest.raises(ValidationError) as e:
+        validate_response(DAILY, body(_daily_rows([2.5, 3.4, 1.6, 4.5, 2.5])), WIN_D)          # tiny volumes: rounding moves the total by >10%
+    assert e.value.code == "non_integer_volume" and "would change the total volume by" in e.value.message and "nothing was stored" in e.value.message
+
+
+def test_integer_valued_float_volumes_are_not_flagged():
+    v = validate_response(DAILY, body(_daily_rows([1000.0, 2000.0, 3000.0])), WIN_D)
+    assert list(v.candles["volume"]) == [1000, 2000, 3000] and v.anomalies.empty
+
+
+def test_the_rounding_flag_follows_only_candles_that_are_stored_not_a_dropped_duplicate_copy():
+    rows = _daily_rows([1_000_000, 2_000_000.4, 3_000_000, 4_000_000])
+    dup = rows[1]
+    b = body(rows + [dup])                                                    # byte-identical second copy of the fractional candle
+    v = validate_response(DAILY, b, WIN_D)
+    assert v.n == 4 and sorted(v.anomalies["kind"]) == ["duplicate_dropped", "volume_rounded"]
+    assert list(v.anomalies[v.anomalies["kind"] == "volume_rounded"]["candle_key"]) == [datetime(2024, 5, 7)]
+
+
+def test_a_response_with_rounded_volumes_commits_cleanly_and_the_integrity_checks_still_pass(tmp_path):
+    from stockdata.db import CandleDB
+    from stockdata.instruments import Instrument
+    from stockdata.reports import integrity_checks
+    inst = Instrument("NSE_EQ", 900002, "SIMVOL", "EQUITY")
+    with CandleDB(DAILY, tmp_path / "d.duckdb") as db:
+        v = validate_response(DAILY, body(_daily_rows([22355.1, 194594.4, 1_000_000, 700_000])), WIN_D)
+        db.commit_window(inst, WIN_D, candles=v.candles, anomalies=v.anomalies, zero_volume=v.zero_volume_rows, attempts=1, http_status=200)
+        assert db.con.execute("SELECT volume FROM candles_daily ORDER BY candle_date").fetchall() == [(22355,), (194594,), (1_000_000,), (700_000,)]
+        assert dict(db.con.execute("SELECT kind, count(*) FROM data_anomalies GROUP BY 1").fetchall()) == {"volume_rounded": 2}
+        assert db.con.execute("SELECT status FROM download_windows").fetchone()[0] == "complete"
+        assert all(c.ok for c in integrity_checks(db))
